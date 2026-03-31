@@ -359,3 +359,57 @@ class StockRepository:
             with conn.cursor() as cur:
                 cur.execute(sql, rec)
                 return cur.fetchone()[0]
+
+    def get_all_recommendations(self) -> list[dict]:
+        """백테스트 평가용: 전체 추천 이력 반환."""
+        sql = """
+            SELECT id, date, rank, code, total_score
+            FROM recommendations
+            ORDER BY date DESC, rank
+        """
+        with DBConnection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(sql)
+                return [dict(r) for r in cur.fetchall()]
+
+    def get_price_on_date(self, code: str, target_date: str) -> int | None:
+        """특정 날짜의 종가를 반환. 없으면 None."""
+        sql = """
+            SELECT close FROM daily_prices
+            WHERE code = %s AND date <= %s
+            ORDER BY date DESC
+            LIMIT 1
+        """
+        with DBConnection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (code, target_date))
+                row = cur.fetchone()
+                return row[0] if row else None
+
+    def save_recommendation_return(self, data: dict) -> None:
+        """recommendation_returns 테이블 upsert."""
+        sql = """
+            INSERT INTO recommendation_returns
+                (recommendation_id, days_after, return_rate, benchmark_rate)
+            VALUES
+                (%(recommendation_id)s, %(days_after)s, %(return_rate)s, %(benchmark_rate)s)
+            ON CONFLICT (recommendation_id, days_after) DO UPDATE SET
+                return_rate    = EXCLUDED.return_rate,
+                benchmark_rate = EXCLUDED.benchmark_rate
+        """
+        with DBConnection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, data)
+
+    def get_recommendation_returns(self, recommendation_id: int) -> list[dict]:
+        """특정 추천의 수익률 기록 반환."""
+        sql = """
+            SELECT days_after, return_rate, benchmark_rate
+            FROM recommendation_returns
+            WHERE recommendation_id = %s
+            ORDER BY days_after
+        """
+        with DBConnection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(sql, (recommendation_id,))
+                return [dict(r) for r in cur.fetchall()]
