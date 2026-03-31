@@ -1,0 +1,46 @@
+[tool.poetry]
+name = "stock-recommender"
+version = "0.1.0"
+description = "코스피200 + 코스닥150 종목 스코어링 및 일별 Top5 추천 시스템"
+authors = ["developer"]
+readme = "README.md"
+packages = [{include = "src"}]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+
+# 데이터 수집
+pykrx = "*"
+opendartreader = "*"
+
+# 데이터 처리
+pandas = "^2.0"
+numpy = "^1.24"
+
+# 기술적 지표
+ta = "*"
+
+# DB
+psycopg2-binary = "*"
+redis = "*"
+
+# 스케줄링
+apscheduler = "^3.10"
+
+# 설정
+pydantic-settings = "*"
+python-dotenv = "*"
+
+# 로깅
+loguru = "*"
+
+# 알림
+requests = "*"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "*"
+pytest-cov = "*"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
