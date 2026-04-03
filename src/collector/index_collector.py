@@ -89,6 +89,8 @@ class IndexCollector:
             repo = StockRepository()
             IndexCollector(repo).run("20240101", "20241231")
         """
+        from src.utils.krx_auth import login_krx_if_needed
+        login_krx_if_needed()
         logger.info(f"코스피 지수 수집 시작 | {fromdate} ~ {todate}")
         n = self.collect(fromdate, todate)
         logger.info(f"코스피 지수 수집 완료 | {n}건")

@@ -58,6 +58,14 @@ class BacktestEvaluator:
         target_dt = base_dt + timedelta(days=n_calendar_days)
         return self.repo.get_price_on_date(code, str(target_dt))
 
+    def _get_index_price_after_n_days(
+        self, index_code: str, base_date: str, n_calendar_days: int
+    ) -> int | None:
+        """코스피 등 지수의 n_calendar_days 이후 종가 반환 (index_prices 테이블)."""
+        base_dt = datetime.strptime(base_date, "%Y-%m-%d").date()
+        target_dt = base_dt + timedelta(days=n_calendar_days)
+        return self.repo.get_index_price_on_date(index_code, str(target_dt))
+
     def evaluate_recommendation(
         self, recommendation_id: int, rec_date: str, code: str
     ) -> int:
@@ -73,8 +81,8 @@ class BacktestEvaluator:
             logger.warning(f"진입 가격 없음 | id={recommendation_id} code={code} date={rec_date}")
             return 0
 
-        # 코스피 기준 가격
-        kospi_entry = self.repo.get_price_on_date(KOSPI_CODE, rec_date)
+        # 코스피 기준 가격 (index_prices 테이블 조회)
+        kospi_entry = self.repo.get_index_price_on_date(KOSPI_CODE, rec_date)
 
         saved = 0
         for days in DAYS_AFTER:
@@ -85,7 +93,7 @@ class BacktestEvaluator:
             # 벤치마크 수익률
             benchmark_rate: float | None = None
             if kospi_entry is not None:
-                kospi_exit = self._get_price_after_n_days(KOSPI_CODE, rec_date, buffer)
+                kospi_exit = self._get_index_price_after_n_days(KOSPI_CODE, rec_date, buffer)
                 benchmark_rate = self._calc_return(kospi_entry, kospi_exit)
 
             try:

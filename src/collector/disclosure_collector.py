@@ -50,7 +50,7 @@ class DisclosureCollector:
         if not _DART_AVAILABLE:
             raise RuntimeError("OpenDartReader가 설치되어 있지 않습니다. pip install opendartreader")
         self.repo = repo
-        self.dart = OpenDartReader.OpenDartReader(settings.dart_api_key)
+        self.dart = OpenDartReader(settings.dart_api_key)
         self._price_collector = PriceCollector(repo)
         # finance_collector의 법인코드 맵 재사용
         self._finance_collector = FinanceCollector(repo)

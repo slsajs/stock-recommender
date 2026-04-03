@@ -36,9 +36,15 @@ from src.scoring.technical import TechnicalScorer
 from src.utils.logger import setup_logger
 
 
-def run_daily() -> None:
-    """일일 스코어링 파이프라인 메인 함수."""
-    today = date.today().strftime("%Y-%m-%d")
+def run_daily(target_date: str | None = None) -> None:
+    """
+    일일 스코어링 파이프라인 메인 함수.
+
+    Args:
+        target_date: 스코어링 기준일 (YYYY-MM-DD). None이면 오늘.
+                     백테스트 시 과거 날짜를 지정하면 해당 시점 데이터만 사용한다.
+    """
+    today = target_date or date.today().strftime("%Y-%m-%d")
     logger.info(f"{'=' * 50}")
     logger.info(f"일일 스코어링 시작 | {today}")
     logger.info(f"{'=' * 50}")
@@ -52,7 +58,7 @@ def run_daily() -> None:
     # ------------------------------------------------------------------
     # 1. Market Regime 판단
     # ------------------------------------------------------------------
-    kospi = repo.get_index_prices(lookback=120)
+    kospi = repo.get_index_prices(lookback=120, as_of_date=today)
     if kospi.empty:
         logger.error("코스피 지수 데이터 없음 — 스코어링 중단 (index_collector 실행 필요)")
         return
@@ -86,14 +92,14 @@ def run_daily() -> None:
     for code in target_pool:
         try:
             # 필터 검사
-            excluded, reason = should_exclude(code, repo)
+            excluded, reason = should_exclude(code, repo, as_of_date=today)
             if excluded:
                 logger.debug(f"제외 | code={code} | {reason}")
                 continue
 
             # 데이터 조회
-            prices = repo.get_prices(code, lookback=300)
-            investor = repo.get_investor_trading(code, lookback=20)
+            prices = repo.get_prices(code, lookback=300, as_of_date=today)
+            investor = repo.get_investor_trading(code, lookback=20, as_of_date=today)
             fin = repo.get_latest_financials(code, as_of_date=today) or {}
             stock_info = repo.get_stock(code) or {}
             sector = stock_info.get("sector")

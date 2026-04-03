@@ -84,6 +84,9 @@ class InvestorCollector:
         ref_date = ref_date or todate
         logger.info(f"투자자 데이터 수집 시작 | {fromdate} ~ {todate} | 종목풀 기준일={ref_date}")
 
+        from src.utils.krx_auth import login_krx_if_needed
+        login_krx_if_needed()
+
         pool = self._price_collector.get_target_pool(ref_date)
         pairs: list[tuple[str, str]] = (
             [(t, "KOSPI") for t in pool["KOSPI"]]

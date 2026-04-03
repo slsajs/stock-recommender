@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import time
 
+import requests
 from loguru import logger
 from pykrx import stock as krx
 
@@ -17,6 +18,38 @@ KOSDAQ150_IDX = "2203"
 
 # pykrx 연속 요청 간 최소 대기 시간 (초) — rate limit 방지
 REQUEST_DELAY = 0.5
+
+# finder_stkisu 폴백 시 종목 수 제한
+KOSPI_LIMIT = 200
+KOSDAQ_LIMIT = 150
+
+
+def _get_tickers_via_finder(mktsel: str, limit: int) -> list[str]:
+    """
+    KRX finder_stkisu API(공개 엔드포인트)로 종목 코드 목록을 가져온다.
+    MDCSTAT* 엔드포인트가 차단된 경우의 폴백으로 사용한다.
+
+    종목은 시가총액 순서를 알 수 없으므로 6자리 숫자 코드를 숫자 오름차순으로 정렬한다.
+    (낮은 번호 = 오래된 대형주와 높은 상관관계)
+    limit개만 반환한다.
+    """
+    url = "https://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://data.krx.co.kr/contents/MDC/MDI/outerLoader/index.cmd",
+    }
+    data = {"bld": "dbms/comm/finder/finder_stkisu", "mktsel": mktsel, "searchText": ""}
+    resp = requests.post(url, headers=headers, data=data, timeout=10)
+    items = resp.json().get("block1", [])
+
+    # 6자리 순수 숫자 코드만 (우선주·전환주 제외)
+    codes = [
+        i["short_code"]
+        for i in items
+        if len(i["short_code"]) == 6 and i["short_code"].isdigit()
+    ]
+    codes.sort()  # 숫자 오름차순 → 오래된 대형주 우선
+    return codes[:limit]
 
 
 class PriceCollector:
@@ -33,16 +66,21 @@ class PriceCollector:
         """
         date 기준 코스피200 + 코스닥150 구성 티커 목록 반환.
 
+        KRX MDCSTAT 엔드포인트가 차단된 경우 finder_stkisu 폴백을 사용한다.
+
         Args:
             date: 기준일 (YYYYMMDD)
 
         Returns:
             {"KOSPI": [...], "KOSDAQ": [...]}
         """
+        from src.utils.krx_auth import login_krx_if_needed
+        login_krx_if_needed()
+
         result: dict[str, list[str]] = {"KOSPI": [], "KOSDAQ": []}
 
         try:
-            kospi200 = krx.get_index_portfolio_deposit_file(date, KOSPI200_IDX)
+            kospi200 = krx.get_index_portfolio_deposit_file(KOSPI200_IDX, date)
             result["KOSPI"] = list(kospi200)
             logger.info(f"코스피200 종목 수: {len(result['KOSPI'])}")
         except Exception as e:
@@ -51,11 +89,34 @@ class PriceCollector:
         time.sleep(REQUEST_DELAY)
 
         try:
-            kosdaq150 = krx.get_index_portfolio_deposit_file(date, KOSDAQ150_IDX)
+            kosdaq150 = krx.get_index_portfolio_deposit_file(KOSDAQ150_IDX, date)
             result["KOSDAQ"] = list(kosdaq150)
             logger.info(f"코스닥150 종목 수: {len(result['KOSDAQ'])}")
         except Exception as e:
             logger.error(f"코스닥150 종목 조회 실패: {e}")
+
+        # KRX MDCSTAT API가 차단된 경우 finder_stkisu 폴백
+        if not result["KOSPI"]:
+            logger.warning(
+                "KRX 지수구성종목 API 응답 없음 — finder_stkisu 폴백 사용 "
+                f"(KOSPI 상위 {KOSPI_LIMIT}개, 숫자코드 오름차순 근사치)"
+            )
+            try:
+                result["KOSPI"] = _get_tickers_via_finder("STK", KOSPI_LIMIT)
+                logger.info(f"폴백 KOSPI 종목 수: {len(result['KOSPI'])}")
+            except Exception as e:
+                logger.error(f"KOSPI 폴백 조회 실패: {e}")
+
+        if not result["KOSDAQ"]:
+            logger.warning(
+                "KRX 지수구성종목 API 응답 없음 — finder_stkisu 폴백 사용 "
+                f"(KOSDAQ 상위 {KOSDAQ_LIMIT}개, 숫자코드 오름차순 근사치)"
+            )
+            try:
+                result["KOSDAQ"] = _get_tickers_via_finder("KSQ", KOSDAQ_LIMIT)
+                logger.info(f"폴백 KOSDAQ 종목 수: {len(result['KOSDAQ'])}")
+            except Exception as e:
+                logger.error(f"KOSDAQ 폴백 조회 실패: {e}")
 
         return result
 
@@ -105,6 +166,7 @@ class PriceCollector:
     def collect_prices_for_ticker(self, code: str, fromdate: str, todate: str) -> int:
         """
         단일 종목 OHLCV + 시총 데이터를 수집하여 daily_prices에 저장.
+        시총 조회 실패 시에도 OHLCV는 저장한다.
 
         Returns:
             저장된 행 수
@@ -112,15 +174,21 @@ class PriceCollector:
         try:
             ohlcv = krx.get_market_ohlcv_by_date(fromdate, todate, code)
             time.sleep(REQUEST_DELAY)
-            cap = krx.get_market_cap_by_date(fromdate, todate, code)
-            time.sleep(REQUEST_DELAY)
         except Exception as e:
-            logger.warning(f"가격 조회 실패 | code={code} | {e}")
+            logger.warning(f"OHLCV 조회 실패 | code={code} | {e}")
             return 0
 
         if ohlcv is None or ohlcv.empty:
             logger.debug(f"가격 데이터 없음 | code={code}")
             return 0
+
+        # 시총·상장주식수는 현재 KRX API 차단으로 수집 불가 — NULL 허용
+        cap = None
+        try:
+            cap = krx.get_market_cap_by_date(fromdate, todate, code)
+            time.sleep(REQUEST_DELAY)
+        except Exception:
+            pass  # 시총 없어도 OHLCV는 저장
 
         cap_index = set(cap.index) if (cap is not None and not cap.empty) else set()
 

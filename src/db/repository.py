@@ -62,17 +62,28 @@ class StockRepository:
     # 가격
     # ------------------------------------------------------------------
 
-    def get_prices(self, code: str, lookback: int = 252) -> pd.DataFrame:
-        sql = """
-            SELECT date, open, high, low, close, volume, trading_value, market_cap, shares_out
-            FROM daily_prices
-            WHERE code = %s
-            ORDER BY date DESC
-            LIMIT %s
-        """
+    def get_prices(self, code: str, lookback: int = 252, as_of_date: str | None = None) -> pd.DataFrame:
+        if as_of_date:
+            sql = """
+                SELECT date, open, high, low, close, volume, trading_value, market_cap, shares_out
+                FROM daily_prices
+                WHERE code = %s AND date <= %s
+                ORDER BY date DESC
+                LIMIT %s
+            """
+            params = (code, as_of_date, lookback)
+        else:
+            sql = """
+                SELECT date, open, high, low, close, volume, trading_value, market_cap, shares_out
+                FROM daily_prices
+                WHERE code = %s
+                ORDER BY date DESC
+                LIMIT %s
+            """
+            params = (code, lookback)
         with DBConnection() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(sql, (code, lookback))
+                cur.execute(sql, params)
                 rows = cur.fetchall()
         if not rows:
             return pd.DataFrame()
@@ -120,17 +131,29 @@ class StockRepository:
                 psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
         logger.debug(f"investor_trading upsert {len(rows)}건")
 
-    def get_investor_trading(self, code: str, lookback: int = 20) -> pd.DataFrame:
-        sql = """
-            SELECT date, inst_net_buy, foreign_net_buy, retail_net_buy
-            FROM investor_trading
-            WHERE code = %s
-            ORDER BY date DESC
-            LIMIT %s
-        """
+    def get_investor_trading(self, code: str, lookback: int = 20, as_of_date: str | None = None) -> pd.DataFrame:
+        if as_of_date:
+            sql = """
+                SELECT date, inst_net_buy, foreign_net_buy, retail_net_buy
+                FROM investor_trading
+                WHERE code = %s AND date <= %s
+                ORDER BY date DESC
+                LIMIT %s
+            """
+        else:
+            sql = """
+                SELECT date, inst_net_buy, foreign_net_buy, retail_net_buy
+                FROM investor_trading
+                WHERE code = %s
+                ORDER BY date DESC
+                LIMIT %s
+            """
         with DBConnection() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(sql, (code, lookback))
+                if as_of_date:
+                    cur.execute(sql, (code, as_of_date, lookback))
+                else:
+                    cur.execute(sql, (code, lookback))
                 rows = cur.fetchall()
         if not rows:
             return pd.DataFrame()
@@ -152,17 +175,28 @@ class StockRepository:
                 psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
         logger.debug(f"index_prices upsert {len(rows)}건")
 
-    def get_index_prices(self, index_code: str = "1001", lookback: int = 120) -> pd.DataFrame:
-        sql = """
-            SELECT date, close
-            FROM index_prices
-            WHERE index_code = %s
-            ORDER BY date DESC
-            LIMIT %s
-        """
+    def get_index_prices(self, index_code: str = "1001", lookback: int = 120, as_of_date: str | None = None) -> pd.DataFrame:
+        if as_of_date:
+            sql = """
+                SELECT date, close
+                FROM index_prices
+                WHERE index_code = %s AND date <= %s
+                ORDER BY date DESC
+                LIMIT %s
+            """
+            params = (index_code, as_of_date, lookback)
+        else:
+            sql = """
+                SELECT date, close
+                FROM index_prices
+                WHERE index_code = %s
+                ORDER BY date DESC
+                LIMIT %s
+            """
+            params = (index_code, lookback)
         with DBConnection() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(sql, (index_code, lookback))
+                cur.execute(sql, params)
                 rows = cur.fetchall()
         if not rows:
             return pd.DataFrame()
@@ -260,16 +294,27 @@ class StockRepository:
     # 공시
     # ------------------------------------------------------------------
 
-    def get_recent_disclosures(self, code: str, days: int = 30) -> list[dict]:
-        sql = """
-            SELECT * FROM disclosures
-            WHERE code = %s
-              AND disclosed_at >= NOW() - INTERVAL '%s days'
-            ORDER BY disclosed_at DESC
-        """
+    def get_recent_disclosures(self, code: str, days: int = 30, as_of_date: str | None = None) -> list[dict]:
+        if as_of_date:
+            sql = """
+                SELECT * FROM disclosures
+                WHERE code = %s
+                  AND disclosed_at <= %s
+                  AND disclosed_at >= %s::date - INTERVAL '%s days'
+                ORDER BY disclosed_at DESC
+            """
+            params = (code, as_of_date, as_of_date, days)
+        else:
+            sql = """
+                SELECT * FROM disclosures
+                WHERE code = %s
+                  AND disclosed_at >= NOW() - INTERVAL '%s days'
+                ORDER BY disclosed_at DESC
+            """
+            params = (code, days)
         with DBConnection() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(sql, (code, days))
+                cur.execute(sql, params)
                 return [dict(r) for r in cur.fetchall()]
 
     def upsert_disclosure(self, disc: dict) -> None:
@@ -383,6 +428,20 @@ class StockRepository:
         with DBConnection() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, (code, target_date))
+                row = cur.fetchone()
+                return row[0] if row else None
+
+    def get_index_price_on_date(self, index_code: str, target_date: str) -> int | None:
+        """index_prices 테이블에서 특정 날짜의 지수 종가를 반환. 없으면 None."""
+        sql = """
+            SELECT close FROM index_prices
+            WHERE index_code = %s AND date <= %s
+            ORDER BY date DESC
+            LIMIT 1
+        """
+        with DBConnection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (index_code, target_date))
                 row = cur.fetchone()
                 return row[0] if row else None
 

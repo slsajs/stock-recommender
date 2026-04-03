@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     redis_host: str = "localhost"
     redis_port: int = 6379
 
+    # KRX (data.krx.co.kr — 2026년 1월부터 로그인 필수)
+    krx_id: str = ""
+    krx_pw: str = ""
+
     # DART API
     dart_api_key: str = ""
 

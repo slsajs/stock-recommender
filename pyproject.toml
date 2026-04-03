@@ -10,12 +10,13 @@ packages = [{include = "src"}]
 python = "^3.11"
 
 # 데이터 수집
-pykrx = "*"
+pykrx = "^1.2.4"
 opendartreader = "*"
 
 # 데이터 처리
 pandas = "^2.0"
 numpy = "^1.24"
+scipy = "*"
 
 # 기술적 지표
 ta = "*"

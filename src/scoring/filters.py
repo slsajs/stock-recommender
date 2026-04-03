@@ -27,22 +27,17 @@ RECENT_VOLUME_DAYS = 5
 DISCLOSURE_CHECK_DAYS = 30
 
 
-def should_exclude(code: str, db) -> tuple[bool, str]:
+def should_exclude(code: str, db, as_of_date: str | None = None) -> tuple[bool, str]:
     """
     종목이 추천 후보에서 제외되어야 하는지 판단한다.
 
     Args:
-        code: 종목코드
-        db:   StockRepository 인스턴스
+        code:        종목코드
+        db:          StockRepository 인스턴스
+        as_of_date:  기준일 (백테스트용, None이면 현재 기준)
 
     Returns:
         (제외 여부, 사유 문자열)
-
-    제외 조건:
-        1. 비활성 종목 (is_active=False)
-        2. 상장 60거래일 미만
-        3. 최근 5거래일 내 거래량 0 존재
-        4. 최근 30일 내 위험 공시 존재
     """
     # 1. 비활성 종목
     stock = db.get_stock(code)
@@ -50,20 +45,21 @@ def should_exclude(code: str, db) -> tuple[bool, str]:
         return True, "비활성 종목"
 
     # 2. 상장 60거래일 미만
-    prices = db.get_prices(code, lookback=MIN_TRADING_DAYS)
+    prices = db.get_prices(code, lookback=MIN_TRADING_DAYS, as_of_date=as_of_date)
     if len(prices) < MIN_TRADING_DAYS:
         return True, f"거래일 부족 ({len(prices)}일 < {MIN_TRADING_DAYS}일)"
 
     # 3. 최근 5거래일 내 거래량 0 (거래정지 의심)
     if "volume" in prices.columns:
         recent_volume = prices.tail(RECENT_VOLUME_DAYS)["volume"]
-        # volume 컬럼이 None/NaN인 경우도 0으로 취급
         if recent_volume.fillna(0).eq(0).any():
             return True, "최근 5거래일 내 거래량 0"
 
     # 4. 위험 공시 존재 (최근 30일)
     try:
-        recent_disclosures = db.get_recent_disclosures(code, days=DISCLOSURE_CHECK_DAYS)
+        recent_disclosures = db.get_recent_disclosures(
+            code, days=DISCLOSURE_CHECK_DAYS, as_of_date=as_of_date
+        )
         for disc in recent_disclosures:
             cat = disc.get("category", "")
             if cat in EXCLUDE_DISCLOSURE_CATEGORIES:
