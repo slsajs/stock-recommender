@@ -1,8 +1,13 @@
 """
 main.py
-APScheduler를 이용해 매일 16:30에 일일 스코어링 파이프라인을 실행한다.
+APScheduler를 이용해 매일 자동으로 데이터를 수집하고 스코어링을 실행한다.
 
-파이프라인 순서:
+스케줄:
+  16:00 KST — collect_daily()       : 가격·투자자·지수·공시 수집 (pykrx + DART)
+  16:30 KST — run_daily()           : 스코어링 → Top 5 추천 저장
+  토요일 02:00 KST — collect_finance_weekly() : 재무제표 수집 (분기 데이터)
+
+파이프라인 순서 (run_daily):
   1. Market Regime 판단 (코스피 MA20/MA60)
   2. 재무 데이터 캐시 (루프 밖 한 번만)
   3. 대상 종목 풀 조회
@@ -16,13 +21,18 @@ from __future__ import annotations
 
 import signal
 import sys
-from datetime import date
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 from loguru import logger
 
+from src.collector.disclosure_collector import DisclosureCollector
+from src.collector.finance_collector import FinanceCollector
+from src.collector.index_collector import IndexCollector
+from src.collector.investor_collector import InvestorCollector
+from src.collector.price_collector import PriceCollector
 from src.config import settings
 from src.db.connection import close_pool, init_pool
 from src.db.repository import StockRepository
@@ -34,6 +44,117 @@ from src.scoring.market_regime import determine_regime
 from src.scoring.momentum import MomentumScorer
 from src.scoring.technical import TechnicalScorer
 from src.utils.logger import setup_logger
+
+
+def collect_daily(target_date: str | None = None) -> None:
+    """
+    일일 데이터 수집 파이프라인 (16:00 실행).
+
+    수집 항목:
+      1. 코스피 지수   — index_prices (Market Regime 판단용)
+      2. 가격·종목마스터 — daily_prices + stocks (OHLCV, 시총)
+      3. 투자자 매매동향 — investor_trading
+      4. 공시 (최근 30일) — disclosures (필터용, DART 키 필요)
+
+    재무제표는 분기 단위라 매일 수집 불필요 → collect_finance_weekly() 에서 처리.
+
+    Args:
+        target_date: 수집 기준일 (YYYY-MM-DD). None이면 오늘.
+                     백테스트·수동 재수집 시 과거 날짜 지정 가능.
+    """
+    today_dt = (
+        datetime.strptime(target_date, "%Y-%m-%d").date()
+        if target_date
+        else date.today()
+    )
+    today_yyyymmdd = today_dt.strftime("%Y%m%d")
+    today_str = today_dt.strftime("%Y-%m-%d")
+
+    logger.info(f"{'=' * 50}")
+    logger.info(f"일일 데이터 수집 시작 | {today_str}")
+    logger.info(f"{'=' * 50}")
+
+    repo = StockRepository()
+
+    # ------------------------------------------------------------------
+    # 1. 코스피 지수 — 스코어링 전에 index_prices 테이블에 있어야 함
+    # ------------------------------------------------------------------
+    logger.info("[수집 1/4] 코스피 지수")
+    try:
+        IndexCollector(repo).run(today_yyyymmdd, today_yyyymmdd)
+    except Exception as e:
+        logger.error(f"코스피 지수 수집 실패 (스코어링 시 Market Regime 판단 불가): {e}")
+
+    # ------------------------------------------------------------------
+    # 2. 가격 + 종목 마스터 (PriceCollector.run 내부에서 함께 처리)
+    # ------------------------------------------------------------------
+    logger.info("[수집 2/4] 가격 · 종목 마스터")
+    try:
+        PriceCollector(repo).run(today_yyyymmdd, today_yyyymmdd)
+    except Exception as e:
+        logger.error(f"가격 수집 실패: {e}")
+
+    # ------------------------------------------------------------------
+    # 3. 투자자별 매매동향
+    # ------------------------------------------------------------------
+    logger.info("[수집 3/4] 투자자 매매동향")
+    try:
+        InvestorCollector(repo).run(today_yyyymmdd, today_yyyymmdd)
+    except Exception as e:
+        logger.error(f"투자자 데이터 수집 실패: {e}")
+
+    # ------------------------------------------------------------------
+    # 4. 공시 — filters.py에서 최근 30일치가 필요하므로 30일 범위 수집
+    #    DART API 키 미설정 시 스킵 (필터에서 위험 공시 체크가 작동하지 않음)
+    # ------------------------------------------------------------------
+    if settings.dart_api_key:
+        logger.info("[수집 4/4] 공시 (최근 30일)")
+        start_str = (today_dt - timedelta(days=30)).strftime("%Y-%m-%d")
+        try:
+            DisclosureCollector(repo).run(start=start_str, end=today_str)
+        except RuntimeError as e:
+            # OpenDartReader 미설치 시
+            logger.warning(f"공시 수집 스킵 — {e}")
+        except Exception as e:
+            logger.error(f"공시 수집 실패: {e}")
+    else:
+        logger.warning(
+            "[수집 4/4] DART_API_KEY 미설정 — 공시 수집 스킵 "
+            "(위험 공시 필터가 작동하지 않습니다. .env에 DART_API_KEY를 설정하세요)"
+        )
+
+    logger.info(f"일일 데이터 수집 완료 | {today_str}")
+
+
+def collect_finance_weekly() -> None:
+    """
+    재무제표 주간 수집 (토요일 02:00 실행).
+
+    당해연도 + 전년도 2개 연도를 수집한다.
+    재무제표는 분기(3개월)마다 갱신되므로 매일 수집할 필요가 없고,
+    350종목 × 분기 4회 × 2년 = DART API 호출 비용이 크다.
+
+    DART API 키 미설정 시 스킵.
+    """
+    if not settings.dart_api_key:
+        logger.warning("DART_API_KEY 미설정 — 재무제표 주간 수집 스킵")
+        return
+
+    current_year = date.today().year
+    repo = StockRepository()
+
+    logger.info(f"{'=' * 50}")
+    logger.info(f"재무제표 주간 수집 시작 | years=[{current_year - 1}, {current_year}]")
+    logger.info(f"{'=' * 50}")
+
+    try:
+        FinanceCollector(repo).run(years=[current_year - 1, current_year])
+    except RuntimeError as e:
+        logger.warning(f"재무제표 수집 스킵 — {e}")
+    except Exception as e:
+        logger.error(f"재무제표 수집 실패: {e}")
+
+    logger.info("재무제표 주간 수집 완료")
 
 
 def run_daily(target_date: str | None = None) -> None:
@@ -205,6 +326,20 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _shutdown)
 
     scheduler = BlockingScheduler(timezone="Asia/Seoul")
+
+    # 16:00 — 일일 데이터 수집 (가격·투자자·지수·공시)
+    # 스코어링(16:30)보다 30분 먼저 실행해 데이터가 준비되도록 한다.
+    # 350종목 기준 수집 소요시간 약 10~15분으로 충분한 여유가 있다.
+    scheduler.add_job(
+        collect_daily,
+        CronTrigger(hour=16, minute=0, timezone="Asia/Seoul"),
+        id="daily_collect",
+        name="일일 데이터 수집",
+        misfire_grace_time=300,
+        coalesce=True,
+    )
+
+    # 16:30 — 일일 스코어링 → Top 5 추천
     scheduler.add_job(
         run_daily,
         CronTrigger(
@@ -214,12 +349,25 @@ def main() -> None:
         ),
         id="daily_scoring",
         name="일일 스코어링",
-        misfire_grace_time=300,   # 5분 내 지연 허용
-        coalesce=True,            # 누락된 실행 하나로 합산
+        misfire_grace_time=300,
+        coalesce=True,
+    )
+
+    # 토요일 02:00 — 재무제표 주간 수집 (분기 데이터, DART API)
+    scheduler.add_job(
+        collect_finance_weekly,
+        CronTrigger(day_of_week="sat", hour=2, minute=0, timezone="Asia/Seoul"),
+        id="weekly_finance",
+        name="주간 재무제표 수집",
+        misfire_grace_time=1800,   # 30분 내 지연 허용
+        coalesce=True,
     )
 
     logger.info(
-        f"스케줄러 시작 | 매일 {settings.schedule_hour:02d}:{settings.schedule_minute:02d} KST 실행"
+        f"스케줄러 시작 | "
+        f"수집=매일 16:00, "
+        f"스코어링=매일 {settings.schedule_hour:02d}:{settings.schedule_minute:02d}, "
+        f"재무제표=토요일 02:00 (KST)"
     )
     scheduler.start()
 
