@@ -25,6 +25,7 @@ class ScoreAggregator:
     def aggregate(self, result: ScoreResult, weights: dict[str, float]) -> ScoreResult:
         """
         3개 부문 점수를 가중합하여 result.total_score 갱신.
+        이후 보정값(macro_adjustment 등)을 합산해 adjusted_total_score 계산.
 
         None인 부문은 중립값 50.0으로 대체한다.
         """
@@ -38,13 +39,29 @@ class ScoreAggregator:
             + mom * weights["momentum"],
             2,
         )
+
+        # [고도화] 보정값 합산 → adjusted_total_score
+        total_adjustment = (
+            result.macro_adjustment
+            + result.disclosure_adjustment
+            + result.news_adjustment
+        )
+        result.adjusted_total_score = round(result.total_score + total_adjustment, 2)
+
         return result
 
     def get_top_n(
         self, results: list[ScoreResult], n: int = TOP_N
     ) -> list[ScoreResult]:
-        """total_score 내림차순 정렬 후 상위 n개에 rank 부여."""
-        sorted_results = sorted(results, key=lambda r: r.total_score, reverse=True)
+        """adjusted_total_score 내림차순 정렬 후 상위 n개에 rank 부여.
+
+        보정값이 없으면 adjusted_total_score == total_score이므로 기존과 동일하게 동작.
+        """
+        sorted_results = sorted(
+            results,
+            key=lambda r: r.adjusted_total_score if r.adjusted_total_score is not None else r.total_score,
+            reverse=True,
+        )
         top = sorted_results[:n]
         for i, r in enumerate(top, 1):
             r.rank = i

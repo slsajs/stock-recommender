@@ -124,9 +124,9 @@ class TestHigh52Score:
 class TestMomentumScore:
     def test_momentum_score_is_average(self, scorer):
         """momentum_score = (volume + inst + high52) / 3."""
-        volumes = [1_000_000] * 20 + [5_000_000]  # 5배 급증
-        closes = list(range(9000, 9100)) + [9100]
+        closes = list(range(9000, 9100)) + [9100]   # 101개
         highs = closes.copy()
+        volumes = [1_000_000] * 100 + [5_000_000]   # 101개, 마지막 5배 급증
         prices = _make_prices(closes, highs=highs, volumes=volumes)
         investor = _make_investor([1_000_000_000] * 20)
         result = scorer.score("TEST", prices=prices, investor=investor)

@@ -23,26 +23,53 @@
 6. [실행 방법](#실행-방법)
 7. [테스트](#테스트)
 8. [백테스트](#백테스트)
-9. [프로젝트 구조](#프로젝트-구조)
-10. [트러블슈팅](#트러블슈팅)
+9. [고도화 — STEP A: 금리 트렌드 기반 재무 가중치 조절](#고도화--step-a-금리-트렌드-기반-재무-가중치-조절)
+10. [고도화 — STEP B: 환율 → 섹터별 점수 보정](#고도화--step-b-환율--섹터별-점수-보정)
+11. [섹터 데이터 수집 가이드](#섹터-데이터-수집-가이드)
+12. [프로젝트 구조](#프로젝트-구조)
+13. [트러블슈팅](#트러블슈팅)
 
 ---
 
 ## 핵심 공식
 
-
 ```
 최종점수 = 기술점수(가변%) + 재무점수(40%) + 모멘텀점수(가변%)
 ```
+
+**도메인 가중치 — Market Regime에 따라 동적 결정**
 
 | 시장 상태 | 기술점수 | 재무점수 | 모멘텀점수 |
 |---|---|---|---|
 | BULL (MA20 > MA60) | 20% | 40% | 40% |
 | BEAR (MA20 ≤ MA60) | 45% | 40% | 15% |
 
+**재무점수 내부 가중치 — [STEP A] 금리 트렌드에 따라 동적 결정**
+
+| 금리 트렌드 | PER | PBR | ROE | 부채비율 |
+|---|---|---|---|---|
+| STABLE (기본) | 30% | 25% | 30% | 15% |
+| RISING (인상기) | 40% | 25% | 20% | 15% |
+| FALLING (인하기) | 20% | 20% | 40% | 20% |
+
+> ECOS_API_KEY 미설정 시 STABLE(기본값)로 동작합니다.
+
+**섹터 보정 — [STEP B] 환율 변동에 따라 섹터별 adjusted_total_score 가감**
+
+| 섹터 유형 | 해당 섹터 | 보정 방향 |
+|---|---|---|
+| 수출 수혜 | 반도체, 자동차, 조선, 전자부품, 디스플레이, IT하드웨어 | 환율 1% 상승당 +1점 (최대 +5) |
+| 수입 비용 | 항공, 정유, 철강, 화학 | 환율 1% 상승당 -1점 (최대 -5) |
+| 기타 | (위 이외) | 0 (보정 없음) |
+
+> 섹터 정보(`stocks.sector`)가 NULL인 종목은 보정값 0.0으로 처리됩니다.
+> 섹터 데이터 수집 방법은 [섹터 데이터 수집 가이드](#섹터-데이터-수집-가이드)를 참고하세요.
+
 ---
 
 ## 구현 현황
+
+**MVP**
 
 | 단계 | 내용 | 상태 |
 |---|---|---|
@@ -53,6 +80,17 @@
 | 5단계 | main.py (APScheduler 16:30 자동 실행) | 완료 |
 | 6단계 | BacktestEvaluator (1/5/20/60일 수익률) | 완료 |
 | 7단계 | Slack 알림 | 미구현 |
+
+**고도화**
+
+| STEP | 내용 | 상태 |
+|---|---|---|
+| STEP A | 금리 트렌드 → FundamentalScorer 내부 가중치 동적 조절 | 완료 |
+| STEP B | 환율 → 섹터별 점수 보정 | 완료 |
+| STEP C | 장단기 금리차 → Market Regime 보강 | 미구현 |
+| STEP D | 미국 시장 급락 → 추천 보류 | 미구현 |
+| STEP E | 공시 감성 (규칙 기반) 보정 | 미구현 |
+| STEP F | 뉴스 감성 보정 | 미구현 |
 
 ---
 
@@ -215,6 +253,12 @@ REDIS_PORT=6379
 # https://opendart.fss.or.kr/ 에서 회원가입 후 발급
 # 재무제표·공시 수집에 필요. 가격/투자자/지수는 API 키 없이 수집 가능.
 DART_API_KEY=your_dart_api_key_here
+
+# ── [고도화] ECOS API (한국은행 경제통계 — STEP A~C) ─────────────
+# https://ecos.bok.or.kr/ 에서 회원가입 후 발급 (무료)
+# 기준금리(BASE_RATE), 환율(USD_KRW), 국고채(KTB_10Y) 수집에 필요
+# 미설정 시 재무 내부 가중치는 STABLE 기본값으로 동작
+ECOS_API_KEY=
 
 # ── Slack (7단계 — 현재 미구현) ───────────────────────────────────
 SLACK_WEBHOOK_URL=
@@ -452,6 +496,89 @@ DisclosureCollector(repo).run('2024-01-01', '2024-12-31')
 
 ---
 
+### Step 6. 거시경제 지표 — [고도화 STEP A·B] ECOS API 키 필요
+
+기준금리(BASE_RATE), 원/달러 환율(USD_KRW), 국고채 10년물(KTB_10Y) 데이터를 수집합니다.
+
+- **STEP A**: BASE_RATE 3개월 변동 → 재무점수 내부 가중치(PER/ROE 비중) 동적 조절
+- **STEP B**: USD_KRW 20거래일 변동률 → 수출/수입 섹터 종목의 adjusted_total_score 가감
+
+**API 키 발급:**
+
+1. [ecos.bok.or.kr](https://ecos.bok.or.kr/) 접속 → 로그인 → `Open API` 메뉴
+2. `인증키 신청` → 이메일 인증 후 발급 (무료, 당일 발급)
+3. `.env`의 `ECOS_API_KEY`에 발급받은 키 입력
+
+**패키지 설치 확인 (이미 poetry install로 설치되어 있어야 합니다):**
+
+```powershell
+poetry run python -c "import ecos; print('ecos 설치 확인')"
+```
+
+`ModuleNotFoundError`가 나오면:
+
+```powershell
+poetry add ecos
+
+docker exec -i stock-db psql -U postgres -d stock_recommender < src/db/migrate_upgrade.sql
+```
+
+**초기 수집 (1년치):**
+
+```powershell
+poetry run python -c "
+from src.utils.logger import setup_logger
+from src.db.connection import init_pool, close_pool
+from src.db.repository import StockRepository
+from src.collector.macro_collector import MacroCollector
+setup_logger()
+init_pool()
+repo = StockRepository()
+MacroCollector(repo).run(
+    indicator_codes=['BASE_RATE', 'USD_KRW', 'KTB_10Y'],
+    start_date='20240101',
+    end_date='20241231',
+)
+close_pool()
+"
+```
+
+- `macro_indicators` 테이블에 저장
+- 소요 시간: **약 1~2분** (3개 지표 × 약 12~250건)
+- ECOS API는 하루 호출 제한이 없음
+
+**적재 확인:**
+
+```powershell
+docker exec -it stock-db psql -U postgres -d stock_recommender -c "
+SELECT indicator_code, COUNT(*) AS rows, MIN(date) AS from_date, MAX(date) AS to_date
+FROM macro_indicators
+GROUP BY indicator_code
+ORDER BY indicator_code;
+"
+```
+
+정상 적재 시 출력:
+
+```
+ indicator_code | rows | from_date  |  to_date
+----------------+------+------------+------------
+ BASE_RATE      |   12 | 2024-01-01 | 2024-12-01
+ KTB_10Y        |  250 | 2024-01-02 | 2024-12-31
+ USD_KRW        |  248 | 2024-01-02 | 2024-12-31
+```
+
+> BASE_RATE는 한국은행 금통위 결정 시에만 변경(연 8회)되므로 월별 데이터로 수집됩니다.
+> USD_KRW, KTB_10Y는 영업일 기준 일별 데이터입니다.
+
+---
+
+> **Step 6는 선택 사항입니다.**
+> ECOS_API_KEY 미설정 시 금리 트렌드 판단을 건너뛰고 재무 내부 가중치는 STABLE 기본값
+> (PER 30%, PBR 25%, ROE 30%, 부채비율 15%)으로 고정됩니다.
+
+---
+
 ### 적재 현황 확인
 
 ```powershell
@@ -543,16 +670,18 @@ poetry run pytest tests/test_momentum.py -v
 poetry run pytest tests/test_market_regime.py -v
 poetry run pytest tests/test_filters.py -v
 poetry run pytest tests/test_aggregator.py -v
+poetry run pytest tests/test_macro_adjuster.py -v    # [STEP A]
 ```
 
 | 테스트 파일 | 주요 케이스 |
 |---|---|
 | `test_technical.py` | RSI ≤ 30 → 70점 이상, RSI ≥ 70 → 30점 이하, 데이터 5일 미만 → 50.0 |
-| `test_fundamental.py` | 섹터 내 PER 최저 → 90점 이상, 섹터 5개 미만 → 전체 폴백, PER 음수/None → 30.0 |
+| `test_fundamental.py` | 섹터 내 PER 최저 → 높은 점수, 섹터 5개 미만 → 전체 폴백, PER 음수/None → 30.0 |
 | `test_momentum.py` | 거래량 5배 급증 → 100점, 데이터 없음 → 50.0, 52주 신고가 → 100점 |
 | `test_market_regime.py` | MA20 > MA60 → BULL + 모멘텀 0.40, MA20 < MA60 → BEAR + 기술 0.45 |
 | `test_filters.py` | 상장 60일 미만 → 제외, 5일 거래량 0 → 제외, 관리종목 공시 → 제외 |
 | `test_aggregator.py` | 가중합·순위 계산, 실패율 30% 초과 → 추천 중단 |
+| `test_macro_adjuster.py` | [STEP A] 금리 0.5%p 상승 → RISING, 가중치 합 = 1.0 / [STEP B] 수출 섹터+환율 상승 → +보정, 클리핑 ±5.0 |
 
 ---
 
@@ -587,6 +716,383 @@ ORDER BY r.date DESC, r.rank;
 
 ---
 
+## 고도화 — STEP A: 금리 트렌드 기반 재무 가중치 조절
+
+### 개요
+
+기준금리 방향에 따라 `FundamentalScorer` 내부의 PER/ROE 가중치를 자동으로 조절합니다.
+
+- **금리 인상기(RISING)**: 미래 이익의 현재 가치 감소 → 저PER 가치주 선호 → PER 비중 ↑, ROE 비중 ↓
+- **금리 인하기(FALLING)**: 성장 기대감 증가 → 고ROE 성장주 선호 → ROE 비중 ↑, PER 비중 ↓
+- **변동 없음(STABLE)**: 기본 가중치 유지
+
+### 판단 기준
+
+ECOS API에서 수집한 `BASE_RATE`(월별 기준금리)를 기준으로, 최근 3개월간 변동폭이 0.25%p 이상이면 트렌드가 있다고 판단합니다.
+
+| 조건 | 트렌드 |
+|---|---|
+| 3개월간 0.25%p 이상 상승 | RISING |
+| 3개월간 0.25%p 이상 하락 | FALLING |
+| 변동폭 0.25%p 미만 | STABLE |
+| 데이터 1건 이하 | STABLE (안전 폴백) |
+
+### 파이프라인 내 동작 위치
+
+```
+run_daily()
+  ├── [1] Market Regime 판단 (코스피 MA20/MA60)
+  ├── [1-b] 금리 트렌드 판단 → FundamentalScorer 내부 가중치 결정  ← STEP A
+  ├── [2] 재무 데이터 캐시
+  └── [4] 종목별 스코어링
+           └── FundamentalScorer.score(..., fund_internal_weights=...)
+```
+
+### 로그 확인
+
+STEP A가 적용되면 아래와 같은 로그가 출력됩니다:
+
+```
+2024-01-15 16:30:01 | INFO | 금리 트렌드: RISING | 재무 내부 가중치={'per': 0.40, 'pbr': 0.25, 'roe': 0.20, 'debt': 0.15}
+```
+
+ECOS 키가 없거나 데이터 부족 시:
+
+```
+2024-01-15 16:30:01 | INFO | 금리 트렌드: STABLE | 재무 내부 가중치={'per': 0.30, 'pbr': 0.25, 'roe': 0.30, 'debt': 0.15}
+```
+
+### 수동으로 금리 트렌드 확인
+
+```powershell
+poetry run python -c "
+from src.utils.logger import setup_logger
+from src.db.connection import init_pool, close_pool
+from src.db.repository import StockRepository
+from src.scoring.macro_adjuster import determine_rate_trend, get_fundamental_weights
+setup_logger()
+init_pool()
+repo = StockRepository()
+trend = determine_rate_trend(repo)
+weights = get_fundamental_weights(trend)
+print(f'트렌드: {trend}')
+print(f'가중치: {weights}')
+close_pool()
+"
+```
+
+### 백테스트로 STEP A 효과 검증
+
+STEP A 적용 전후 추천 성과를 비교하는 방법:
+
+```powershell
+# STEP A 적용 전 추천 이력이 있어야 합니다
+# 비교 쿼리 (psql)
+docker exec -it stock-db psql -U postgres -d stock_recommender -c "
+SELECT
+  AVG(rr.return_rate - rr.benchmark_rate) AS avg_alpha,
+  COUNT(*) AS sample_count
+FROM recommendation_returns rr
+JOIN recommendations r ON r.id = rr.recommendation_id
+WHERE rr.days_after = 20;
+"
+```
+
+> STEP A 적용 전 alpha와 비교했을 때 개선되지 않으면 `macro_adjuster.py`의
+> `determine_rate_trend()`에서 항상 `"STABLE"`을 반환하도록 임시 변경하여 비활성화할 수 있습니다.
+
+---
+
+## 고도화 — STEP B: 환율 → 섹터별 점수 보정
+
+### 개요
+
+원/달러 환율(USD_KRW) 최근 20거래일 변동률에 따라 수출 수혜주에 가점, 수입 비용 증가주에 감점을 적용합니다.
+보정값은 `stock_scores.macro_adjustment` 컬럼에 저장되며 `adjusted_total_score`에 반영됩니다.
+
+- **원화 약세(환율 상승)**: 수출기업 원화 매출 증가 → 반도체·자동차·조선 등 가점
+- **원화 강세(환율 하락)**: 수입 원자재 비용 절감 → 항공·정유·철강·화학 가점
+
+### 보정 규칙
+
+| 섹터 유형 | 해당 섹터 | 보정값 계산 | 최대/최소 |
+|---|---|---|---|
+| 수출 수혜 | 반도체, 자동차, 조선, 전자부품, 디스플레이, IT하드웨어 | 환율변동률(%) × +1.0 | ±5.0 |
+| 수입 비용 | 항공, 정유, 철강, 화학 | 환율변동률(%) × -1.0 | ±5.0 |
+| 기타 / NULL | (위 이외 또는 섹터 미분류) | 0.0 | - |
+
+**예시:**
+- 환율 +3% 상승(원화 약세) + 반도체 종목 → `macro_adjustment = +3.0`
+- 환율 +3% 상승(원화 약세) + 항공 종목 → `macro_adjustment = -3.0`
+- 환율 +8% 급등 + 자동차 종목 → `macro_adjustment = +5.0` (클리핑)
+
+### 파이프라인 내 동작 위치
+
+```
+run_daily()
+  ├── [1] Market Regime 판단
+  ├── [1-b] 금리 트렌드 판단 (STEP A)
+  ├── [1-c] 환율 변동률 계산 (usd_krw_change)        ← STEP B (루프 밖 1회 계산)
+  ├── [2] 재무 데이터 캐시
+  └── [4] 종목별 스코어링
+           ├── FundamentalScorer → 기본 점수
+           ├── currency_adjustment(sector, usd_krw_change)  ← STEP B (섹터별 적용)
+           └── ScoreResult.macro_adjustment = 보정값
+                  ↓
+  aggregator.aggregate()
+    adjusted_total_score = total_score + macro_adjustment + disclosure_adjustment + news_adjustment
+```
+
+### 로그 확인
+
+STEP B가 적용되면 종목별로 다음 로그가 출력됩니다:
+
+```
+2024-01-15 16:31:22 | DEBUG | 환율 변동률: 1289.4 → 1328.1 (+3.00%)
+2024-01-15 16:31:23 | DEBUG | [005380] 자동차 섹터 | 환율 보정 +3.00 → macro_adjustment=+3.00
+```
+
+섹터 데이터가 없으면(NULL):
+```
+2024-01-15 16:31:23 | DEBUG | [005380] 섹터=None → 환율 보정 0.0
+```
+
+### 수동으로 환율 보정값 확인
+
+```powershell
+poetry run python -c "
+from src.utils.logger import setup_logger
+from src.db.connection import init_pool, close_pool
+from src.db.repository import StockRepository
+from src.scoring.macro_adjuster import get_usd_krw_change, currency_adjustment
+setup_logger()
+init_pool()
+repo = StockRepository()
+change = get_usd_krw_change(repo)
+print(f'최근 20거래일 환율 변동률: {change:+.2f}%')
+for sector in ['반도체', '항공', '유통']:
+    adj = currency_adjustment(sector, change)
+    print(f'  {sector}: {adj:+.2f}')
+close_pool()
+"
+```
+
+### 백테스트로 STEP B 효과 검증
+
+```sql
+-- psql에서 실행
+SELECT
+  s.sector,
+  AVG(ss.macro_adjustment) AS avg_macro_adj,
+  COUNT(*)                 AS cnt
+FROM stock_scores ss
+JOIN stocks s ON s.code = ss.code
+WHERE ss.date >= CURRENT_DATE - INTERVAL '30 days'
+  AND ss.macro_adjustment != 0
+GROUP BY s.sector
+ORDER BY avg_macro_adj DESC;
+```
+
+> STEP B가 실질적으로 동작하려면 `stocks.sector`가 채워져 있어야 합니다.
+> 현재 pykrx는 섹터 정보를 제공하지 않아 대부분 NULL입니다.
+> 섹터 수집 방법은 아래 [섹터 데이터 수집 가이드](#섹터-데이터-수집-가이드)를 참고하세요.
+
+> STEP B를 비활성화하려면 `main.py`에서 `currency_adjustment()` 호출 결과를 0.0으로 고정하거나
+> `macro_adjuster.py`의 `currency_adjustment()`가 항상 `0.0`을 반환하도록 임시 변경하세요.
+
+---
+
+## 섹터 데이터 수집 가이드
+
+### 왜 필요한가
+
+pykrx는 주가·거래량 데이터를 제공하지만 **섹터 분류는 제공하지 않습니다**.
+현재 `stocks.sector` 컬럼이 모두 NULL이어서 STEP B 환율 보정이 동작하지 않습니다.
+
+아래 방법 중 하나로 섹터 데이터를 채울 수 있습니다.
+
+---
+
+### 방법 1 — KRX 정보데이터시스템 (권장, 무료)
+
+KRX 공식 사이트에서 업종분류 파일을 CSV로 다운로드한 후 DB에 업데이트합니다.
+
+**다운로드 경로:**
+
+1. [data.krx.co.kr](https://data.krx.co.kr) 접속
+2. `주식 > 기본 통계 > 주식 종목 검색` → `업종별 현황` 선택
+3. 코스피200, 코스닥150 각각 전체 다운로드 (CSV, Excel 모두 가능)
+
+다운로드한 CSV에는 `종목코드`, `종목명`, `업종명` 컬럼이 포함되어 있습니다.
+
+**DB 업데이트 스크립트:**
+
+```python
+# scripts/update_sectors.py — 프로젝트 루트에 직접 실행
+import csv
+from src.db.connection import init_pool, close_pool, get_connection
+
+# KRX에서 다운받은 CSV 파일 경로 (컬럼: 종목코드, 업종명)
+KRX_CSV = "krx_sectors.csv"
+
+# KRX 업종명 → stocks.sector 매핑 (필요 시 확장)
+SECTOR_MAP = {
+    "반도체":       "반도체",
+    "자동차":       "자동차",
+    "조선":         "조선",
+    "전자부품":     "전자부품",
+    "디스플레이":   "디스플레이",
+    "IT하드웨어":   "IT하드웨어",
+    "항공":         "항공",
+    "정유":         "정유",
+    "철강":         "철강",
+    "화학":         "화학",
+    # KRX 업종명과 STEP B 섹터명이 다른 경우 여기서 매핑
+}
+
+init_pool()
+conn = get_connection()
+cur = conn.cursor()
+
+with open(KRX_CSV, encoding="utf-8-sig") as f:
+    reader = csv.DictReader(f)
+    updated = 0
+    for row in reader:
+        code = row.get("종목코드", "").strip().zfill(6)
+        krx_sector = row.get("업종명", "").strip()
+        sector = SECTOR_MAP.get(krx_sector, krx_sector)  # 매핑 없으면 원본 사용
+        cur.execute(
+            "UPDATE stocks SET sector = %s WHERE code = %s",
+            (sector, code)
+        )
+        if cur.rowcount:
+            updated += 1
+
+conn.commit()
+cur.close()
+conn.close()
+close_pool()
+print(f"섹터 업데이트 완료: {updated}건")
+```
+
+```powershell
+# 실행
+poetry run python scripts/update_sectors.py
+```
+
+---
+
+### 방법 2 — pykrx get_market_sector_classifications (간편)
+
+pykrx에서 KRX 업종 분류를 직접 조회할 수 있습니다.
+
+```python
+from pykrx import stock as pykrx_stock
+
+# 코스피 업종 분류
+kospi_sectors = pykrx_stock.get_market_sector_classifications(date="20241231", market="KOSPI")
+# 코스닥 업종 분류
+kosdaq_sectors = pykrx_stock.get_market_sector_classifications(date="20241231", market="KOSDAQ")
+```
+
+반환 DataFrame 컬럼: `티커`, `종목명`, `업종`
+
+```powershell
+poetry run python -c "
+from src.utils.logger import setup_logger
+from src.db.connection import init_pool, close_pool, get_connection
+from pykrx import stock as pykrx_stock
+import pandas as pd
+setup_logger()
+init_pool()
+
+dfs = []
+for market in ['KOSPI', 'KOSDAQ']:
+    df = pykrx_stock.get_market_sector_classifications('20241231', market)
+    dfs.append(df)
+
+df_all = pd.concat(dfs)
+print(df_all.head())
+
+conn = get_connection()
+cur = conn.cursor()
+updated = 0
+for _, row in df_all.iterrows():
+    code = str(row.get('티커', '')).strip().zfill(6)
+    sector = str(row.get('업종', '')).strip()
+    if not code or not sector:
+        continue
+    cur.execute('UPDATE stocks SET sector = %s WHERE code = %s', (sector, code))
+    if cur.rowcount:
+        updated += 1
+conn.commit()
+cur.close()
+conn.close()
+close_pool()
+print(f'섹터 업데이트 완료: {updated}건')
+"
+```
+
+> pykrx의 업종명이 STEP B의 섹터명과 정확히 일치해야 보정이 적용됩니다.
+> 예: pykrx가 `"전기전자"` 로 반환하지만 STEP B는 `"IT하드웨어"` 로 매핑되어 있지 않으면 보정이 0.0이 됩니다.
+> 위의 `SECTOR_MAP`에 추가 매핑을 넣어 조정하세요.
+
+---
+
+### 방법 3 — DART 고유번호 파일 (corpCode.zip)
+
+DART API의 고유번호 파일에는 업종코드가 포함되어 있습니다.
+
+```powershell
+# DART API 키 필요
+poetry run python -c "
+import OpenDartReader
+dart = OpenDartReader.OpenDartReader('YOUR_DART_API_KEY')
+corp_list = dart.corp_codes
+print(corp_list.columns.tolist())
+print(corp_list[corp_list['stock_code'].notna()].head(10))
+"
+```
+
+> DART의 업종분류는 금융감독원 기준이며 KRX 업종과 다를 수 있습니다.
+> 정밀한 섹터 매핑이 필요하면 DART 업종코드를 STEP B의 섹터명으로 수동 매핑하는 별도 파일을 관리하세요.
+
+---
+
+### 섹터 적재 현황 확인
+
+```powershell
+docker exec -it stock-db psql -U postgres -d stock_recommender -c "
+SELECT
+  sector,
+  COUNT(*) AS cnt
+FROM stocks
+GROUP BY sector
+ORDER BY cnt DESC
+LIMIT 20;
+"
+```
+
+`sector = NULL`이 대부분이면 아직 수집이 안 된 상태입니다.
+
+---
+
+### STEP B가 실제로 동작하는지 확인
+
+```powershell
+docker exec -it stock-db psql -U postgres -d stock_recommender -c "
+SELECT code, date, macro_adjustment, adjusted_total_score, total_score
+FROM stock_scores
+WHERE macro_adjustment != 0
+ORDER BY date DESC
+LIMIT 10;
+"
+```
+
+`macro_adjustment != 0` 인 행이 있으면 STEP B 보정이 적용된 것입니다.
+
+---
+
 ## 프로젝트 구조
 
 ```
@@ -605,7 +1111,8 @@ stock-recommender/
 │   │   ├── investor_collector.py # pykrx: 기관/외국인/개인 순매수
 │   │   ├── index_collector.py    # pykrx: 코스피 지수 (Market Regime)
 │   │   ├── finance_collector.py  # DART: 재무제표 (ROE, 부채비율 등)
-│   │   └── disclosure_collector.py # DART: 공시 (위험 공시 필터용)
+│   │   ├── disclosure_collector.py # DART: 공시 (위험 공시 필터용)
+│   │   └── macro_collector.py    # [STEP A] ECOS: 기준금리·환율·국고채
 │   │
 │   ├── scoring/
 │   │   ├── base.py               # BaseScorer ABC, ScoreResult dataclass
@@ -614,7 +1121,8 @@ stock-recommender/
 │   │   ├── technical.py          # RSI, MACD, 볼린저밴드 (역추세)
 │   │   ├── fundamental.py        # PER, PBR, ROE, 부채비율 (섹터 상대비교)
 │   │   ├── momentum.py           # 거래량 급증, 기관 순매수, 52주 신고가
-│   │   └── aggregator.py         # 가중합 → Top 5 추출
+│   │   ├── aggregator.py         # 가중합 → Top 5 추출
+│   │   └── macro_adjuster.py     # [STEP A] 금리 트렌드 → 재무 내부 가중치 / [STEP B] 환율 → 섹터 보정
 │   │
 │   ├── backtest/
 │   │   └── evaluator.py          # 추천 후 수익률 계산 + KOSPI 벤치마크
@@ -636,7 +1144,8 @@ stock-recommender/
     ├── test_momentum.py
     ├── test_market_regime.py
     ├── test_filters.py
-    └── test_aggregator.py
+    ├── test_aggregator.py
+    └── test_macro_adjuster.py    # [STEP A·B]
 ```
 
 ---
@@ -765,6 +1274,91 @@ PriceCollector(StockRepository()).run('20240101', '20241219')
 
 ---
 
+### ECOS API 오류 / 금리 트렌드가 항상 STABLE이다
+
+**키 미설정 확인:**
+
+```powershell
+Get-Content .env | Select-String "ECOS"
+# ECOS_API_KEY= 이면 키가 없는 것
+```
+
+**패키지 미설치 확인:**
+
+```powershell
+poetry run python -c "import ecos"
+# ModuleNotFoundError 시: poetry add ecos
+```
+
+**데이터 적재 확인:**
+
+```powershell
+docker exec -it stock-db psql -U postgres -d stock_recommender -c "SELECT COUNT(*) FROM macro_indicators WHERE indicator_code='BASE_RATE';"
+# 0이면 Step 6 초기 수집이 안 된 것
+```
+
+**BASE_RATE 데이터가 1건뿐이라 STABLE로 판단되는 경우:**
+
+ECOS에서 BASE_RATE는 월별 데이터입니다. 최근 3개월치(3건 이상)가 있어야 트렌드 판단이 가능합니다.
+`start_date`를 6개월 이전으로 늘려 재수집하세요:
+
+```powershell
+poetry run python -c "
+from src.utils.logger import setup_logger
+from src.db.connection import init_pool, close_pool
+from src.db.repository import StockRepository
+from src.collector.macro_collector import MacroCollector
+setup_logger()
+init_pool()
+MacroCollector(StockRepository()).run(
+    indicator_codes=['BASE_RATE'],
+    start_date='20230101',
+    end_date='20241231',
+)
+close_pool()
+"
+```
+
+---
+
+### STEP B 환율 보정이 모두 0.0이다
+
+**원인 1 — 섹터 데이터 없음 (가장 흔함)**
+
+```powershell
+docker exec -it stock-db psql -U postgres -d stock_recommender -c "
+SELECT COUNT(*) AS null_sector FROM stocks WHERE sector IS NULL;
+"
+```
+
+0이 아니면 섹터 수집이 안 된 것입니다.
+[섹터 데이터 수집 가이드](#섹터-데이터-수집-가이드)를 참고하여 수집하세요.
+
+**원인 2 — 섹터명 불일치**
+
+`stocks.sector` 값이 STEP B의 `EXPORT_SECTORS` / `IMPORT_SECTORS` 목록과 정확히 일치해야 합니다.
+
+```powershell
+docker exec -it stock-db psql -U postgres -d stock_recommender -c "
+SELECT DISTINCT sector FROM stocks WHERE sector IS NOT NULL ORDER BY sector;
+"
+```
+
+출력된 섹터명이 `macro_adjuster.py`의 `EXPORT_SECTORS`, `IMPORT_SECTORS` 리스트 값과 다르면
+해당 파일의 리스트를 DB 값에 맞게 수정하거나 DB 값을 리스트에 맞게 업데이트하세요.
+
+**원인 3 — USD_KRW 데이터 없음**
+
+```powershell
+docker exec -it stock-db psql -U postgres -d stock_recommender -c "
+SELECT COUNT(*) FROM macro_indicators WHERE indicator_code='USD_KRW';
+"
+```
+
+0이면 Step 6 초기 수집(MacroCollector)이 안 된 것입니다.
+
+---
+
 ### 실패율 30% 초과 — 추천이 생성되지 않는다
 
 ```
@@ -789,12 +1383,14 @@ SELECT
 
 ## 데이터 소스 정책
 
-| 데이터 | 소스 | API 키 |
-|---|---|---|
-| 주가·거래량·시총 | pykrx (KRX 공식) | 불필요 |
-| 투자자별 매매동향 | pykrx (KRX 공식) | 불필요 |
-| 코스피 지수 | pykrx (KRX 공식) | 불필요 |
-| 재무제표 | DART 오픈API | **필요** |
-| 공시 정보 | DART 오픈API | **필요** |
+| 데이터 | 소스 | API 키 | 용도 |
+|---|---|---|---|
+| 주가·거래량·시총 | pykrx (KRX 공식) | 불필요 | 기술·모멘텀 스코어링 |
+| 투자자별 매매동향 | pykrx (KRX 공식) | 불필요 | 모멘텀 스코어링 |
+| 코스피 지수 | pykrx (KRX 공식) | 불필요 | Market Regime 판단 |
+| 재무제표 | DART 오픈API | **필요** | 재무 스코어링 |
+| 공시 정보 | DART 오픈API | **필요** | 위험 공시 필터 |
+| 기준금리·환율·국고채 | ECOS (한국은행) | **필요** (STEP A~C) | 재무 내부 가중치 동적 조절 + 섹터별 환율 보정 |
+| 섹터 분류 | KRX 정보데이터시스템 / pykrx | 불필요 | STEP B 환율 보정 동작 조건 |
 
 네이버금융 크롤링은 사용하지 않습니다.

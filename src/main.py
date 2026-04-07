@@ -32,6 +32,7 @@ from src.collector.disclosure_collector import DisclosureCollector
 from src.collector.finance_collector import FinanceCollector
 from src.collector.index_collector import IndexCollector
 from src.collector.investor_collector import InvestorCollector
+from src.collector.macro_collector import MacroCollector
 from src.collector.price_collector import PriceCollector
 from src.config import settings
 from src.db.connection import close_pool, init_pool
@@ -40,6 +41,12 @@ from src.scoring.aggregator import ScoreAggregator
 from src.scoring.base import ScoreResult
 from src.scoring.filters import should_exclude
 from src.scoring.fundamental import FundamentalScorer
+from src.scoring.macro_adjuster import (
+    currency_adjustment,
+    determine_rate_trend,
+    get_fundamental_weights,
+    get_usd_krw_change,
+)
 from src.scoring.market_regime import determine_regime
 from src.scoring.momentum import MomentumScorer
 from src.scoring.technical import TechnicalScorer
@@ -79,7 +86,7 @@ def collect_daily(target_date: str | None = None) -> None:
     # ------------------------------------------------------------------
     # 1. 코스피 지수 — 스코어링 전에 index_prices 테이블에 있어야 함
     # ------------------------------------------------------------------
-    logger.info("[수집 1/4] 코스피 지수")
+    logger.info("[수집 1/5] 코스피 지수")
     try:
         IndexCollector(repo).run(today_yyyymmdd, today_yyyymmdd)
     except Exception as e:
@@ -88,7 +95,7 @@ def collect_daily(target_date: str | None = None) -> None:
     # ------------------------------------------------------------------
     # 2. 가격 + 종목 마스터 (PriceCollector.run 내부에서 함께 처리)
     # ------------------------------------------------------------------
-    logger.info("[수집 2/4] 가격 · 종목 마스터")
+    logger.info("[수집 2/5] 가격 · 종목 마스터")
     try:
         PriceCollector(repo).run(today_yyyymmdd, today_yyyymmdd)
     except Exception as e:
@@ -97,18 +104,34 @@ def collect_daily(target_date: str | None = None) -> None:
     # ------------------------------------------------------------------
     # 3. 투자자별 매매동향
     # ------------------------------------------------------------------
-    logger.info("[수집 3/4] 투자자 매매동향")
+    logger.info("[수집 3/5] 투자자 매매동향")
     try:
         InvestorCollector(repo).run(today_yyyymmdd, today_yyyymmdd)
     except Exception as e:
         logger.error(f"투자자 데이터 수집 실패: {e}")
 
     # ------------------------------------------------------------------
-    # 4. 공시 — filters.py에서 최근 30일치가 필요하므로 30일 범위 수집
+    # 4. 거시경제 지표 (BASE_RATE, USD_KRW, KTB_10Y) — STEP A~C 고도화
+    #    ECOS API 키 미설정 시 스킵 (금리 트렌드 판단이 작동하지 않음)
+    # ------------------------------------------------------------------
+    if settings.ecos_api_key:
+        logger.info("[수집 4/5] 거시경제 지표 (ECOS)")
+        try:
+            MacroCollector(repo).run()
+        except Exception as e:
+            logger.error(f"거시경제 지표 수집 실패: {e}")
+    else:
+        logger.debug(
+            "[수집 4/5] ECOS_API_KEY 미설정 — 거시경제 지표 수집 스킵 "
+            "(금리 트렌드 기반 재무 가중치 조정이 작동하지 않습니다)"
+        )
+
+    # ------------------------------------------------------------------
+    # 5. 공시 — filters.py에서 최근 30일치가 필요하므로 30일 범위 수집
     #    DART API 키 미설정 시 스킵 (필터에서 위험 공시 체크가 작동하지 않음)
     # ------------------------------------------------------------------
     if settings.dart_api_key:
-        logger.info("[수집 4/4] 공시 (최근 30일)")
+        logger.info("[수집 5/5] 공시 (최근 30일)")
         start_str = (today_dt - timedelta(days=30)).strftime("%Y-%m-%d")
         try:
             DisclosureCollector(repo).run(start=start_str, end=today_str)
@@ -192,6 +215,20 @@ def run_daily(target_date: str | None = None) -> None:
     )
 
     # ------------------------------------------------------------------
+    # 1-b. [STEP A] 금리 트렌드 → FundamentalScorer 내부 가중치 결정
+    #      as_of_date 전달로 백테스트 시 해당 시점 금리 반영 (look-ahead bias 방지)
+    # ------------------------------------------------------------------
+    rate_trend = determine_rate_trend(repo, as_of_date=today)
+    fund_internal_weights = get_fundamental_weights(rate_trend)
+    logger.info(f"금리 트렌드: {rate_trend} | 재무 내부 가중치={fund_internal_weights}")
+
+    # ------------------------------------------------------------------
+    # 1-c. [STEP B] 환율 변동률 → 섹터별 보정값 계산 (루프 밖 1회)
+    # ------------------------------------------------------------------
+    usd_krw_change = get_usd_krw_change(repo, as_of_date=today)
+    logger.info(f"환율 변동률 (최근 20거래일): {usd_krw_change:+.2f}%")
+
+    # ------------------------------------------------------------------
     # 2. 재무 데이터 캐시 (루프 밖 한 번만 — 성능 필수)
     # ------------------------------------------------------------------
     all_fin = repo.get_all_financials(as_of_date=today)
@@ -235,8 +272,13 @@ def run_daily(target_date: str | None = None) -> None:
                 sector_financials=sector_fin,
                 all_financials=all_fin,
                 sector_stats=sector_stats or {},
+                fund_internal_weights=fund_internal_weights,  # [STEP A]
             )
             mom = mom_scorer.score(code, prices=prices, investor=investor)
+
+            # [STEP B] 섹터별 환율 보정값 — 백테스트 alpha 악화로 비활성화
+            # macro_adj = currency_adjustment(sector, usd_krw_change)
+            macro_adj = 0.0
 
             # 합산 ScoreResult 조립
             combined = ScoreResult(
@@ -254,6 +296,7 @@ def run_daily(target_date: str | None = None) -> None:
                 inst_score=mom.inst_score,
                 high52_score=mom.high52_score,
                 momentum_score=mom.momentum_score,
+                macro_adjustment=macro_adj,  # [STEP B]
             )
             code_results[code] = combined
 
@@ -272,7 +315,8 @@ def run_daily(target_date: str | None = None) -> None:
     logger.info(f"{'=' * 30} Top 5 추천 {'=' * 30}")
     for r in top5:
         logger.info(
-            f"  #{r.rank} {r.code} | 총점={r.total_score} "
+            f"  #{r.rank} {r.code} | 총점={r.total_score} → 보정후={r.adjusted_total_score} "
+            f"(macro={r.macro_adjustment:+.2f}) "
             f"| tech={r.technical_score} fund={r.fundamental_score} mom={r.momentum_score}"
         )
         repo.save_stock_score(
@@ -295,6 +339,8 @@ def run_daily(target_date: str | None = None) -> None:
                 "total_score": r.total_score,
                 "rank": r.rank,
                 "market_regime": r.market_regime,
+                "macro_adjustment": r.macro_adjustment,          # [STEP B]
+                "adjusted_total_score": r.adjusted_total_score,  # [STEP B]
             }
         )
         repo.save_recommendation(
@@ -302,7 +348,7 @@ def run_daily(target_date: str | None = None) -> None:
                 "date": today,
                 "rank": r.rank,
                 "code": r.code,
-                "total_score": r.total_score,
+                "total_score": r.adjusted_total_score if r.adjusted_total_score is not None else r.total_score,
                 "reason": None,
             }
         )

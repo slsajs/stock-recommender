@@ -45,6 +45,12 @@ class ScoreResult:
     rank: int | None = None
     market_regime: str | None = None
 
+    # [고도화] 보정값 (STEP B~F에서 채워짐)
+    macro_adjustment: float = 0.0          # 환율·미국시장 보정 (STEP B, D)
+    disclosure_adjustment: float = 0.0     # 공시 감성 보정 (STEP E)
+    news_adjustment: float = 0.0           # 뉴스 감성 보정 (STEP F)
+    adjusted_total_score: float | None = None  # total_score + 모든 보정값 합계
+
 
 class BaseScorer(ABC):
     """모든 스코어러의 추상 기반 클래스."""

@@ -14,6 +14,7 @@ import pandas as pd
 from loguru import logger
 
 from src.scoring.base import BaseScorer, ScoreResult
+from src.scoring.macro_adjuster import DEFAULT_FUNDAMENTAL_WEIGHTS
 
 # 섹터 상대비교 최소 종목 수
 MIN_SECTOR_SIZE = 5
@@ -38,15 +39,21 @@ class FundamentalScorer(BaseScorer):
     def score(self, code: str, **kwargs) -> ScoreResult:
         """
         Args:
-            financials (dict):          get_latest_financials() 반환값
+            financials (dict):               get_latest_financials() 반환값
             sector_financials (pd.DataFrame): 같은 섹터 종목들의 재무 DataFrame
             all_financials (pd.DataFrame):    전체 종목 재무 DataFrame (폴백용)
             sector_stats (dict | None):       섹터 통계 (avg_per 등)
+            fund_internal_weights (dict | None):
+                PER/PBR/ROE/부채비율 내부 가중치.
+                {"per": float, "pbr": float, "roe": float, "debt": float}
+                None이면 DEFAULT_FUNDAMENTAL_WEIGHTS 사용.
+                [STEP A] macro_adjuster.get_fundamental_weights()가 주입한다.
         """
         fin: dict = kwargs.get("financials") or {}
         sector_fin: pd.DataFrame = kwargs.get("sector_financials", pd.DataFrame())
         all_fin: pd.DataFrame = kwargs.get("all_financials", pd.DataFrame())
         sector_stats: dict = kwargs.get("sector_stats") or {}
+        weights: dict[str, float] = kwargs.get("fund_internal_weights") or dict(DEFAULT_FUNDAMENTAL_WEIGHTS)
 
         result = ScoreResult(code=code)
 
@@ -57,14 +64,26 @@ class FundamentalScorer(BaseScorer):
         result.roe_score = self._roe_score(fin, sector_fin, all_fin)
         result.debt_score = self._debt_score(fin, sector_fin, all_fin)
 
-        valid = [
-            s for s in [
-                result.per_score, result.pbr_score,
-                result.roe_score, result.debt_score,
-            ]
-            if s is not None
+        # 가중 평균: None인 지표는 제외하고 나머지 가중치를 재정규화
+        score_weight_pairs = [
+            (result.per_score,  weights.get("per",  0.30)),
+            (result.pbr_score,  weights.get("pbr",  0.25)),
+            (result.roe_score,  weights.get("roe",  0.30)),
+            (result.debt_score, weights.get("debt", 0.15)),
         ]
-        result.fundamental_score = round(sum(valid) / len(valid), 2) if valid else 50.0
+        valid_pairs = [(s, w) for s, w in score_weight_pairs if s is not None]
+
+        if not valid_pairs:
+            result.fundamental_score = 50.0
+        else:
+            total_weight = sum(w for _, w in valid_pairs)
+            if total_weight == 0:
+                result.fundamental_score = 50.0
+            else:
+                result.fundamental_score = round(
+                    sum(s * w for s, w in valid_pairs) / total_weight, 2
+                )
+
         return result
 
     # ------------------------------------------------------------------

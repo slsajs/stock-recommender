@@ -361,29 +361,33 @@ class StockRepository:
                 (code, date, rsi_score, macd_score, bb_score, technical_score,
                  per_score, pbr_score, roe_score, debt_score, fundamental_score,
                  volume_score, inst_score, high52_score, momentum_score,
-                 total_score, rank, market_regime)
+                 total_score, rank, market_regime,
+                 macro_adjustment, adjusted_total_score)
             VALUES
                 (%(code)s, %(date)s, %(rsi_score)s, %(macd_score)s, %(bb_score)s, %(technical_score)s,
                  %(per_score)s, %(pbr_score)s, %(roe_score)s, %(debt_score)s, %(fundamental_score)s,
                  %(volume_score)s, %(inst_score)s, %(high52_score)s, %(momentum_score)s,
-                 %(total_score)s, %(rank)s, %(market_regime)s)
+                 %(total_score)s, %(rank)s, %(market_regime)s,
+                 %(macro_adjustment)s, %(adjusted_total_score)s)
             ON CONFLICT (code, date) DO UPDATE SET
-                rsi_score         = EXCLUDED.rsi_score,
-                macd_score        = EXCLUDED.macd_score,
-                bb_score          = EXCLUDED.bb_score,
-                technical_score   = EXCLUDED.technical_score,
-                per_score         = EXCLUDED.per_score,
-                pbr_score         = EXCLUDED.pbr_score,
-                roe_score         = EXCLUDED.roe_score,
-                debt_score        = EXCLUDED.debt_score,
-                fundamental_score = EXCLUDED.fundamental_score,
-                volume_score      = EXCLUDED.volume_score,
-                inst_score        = EXCLUDED.inst_score,
-                high52_score      = EXCLUDED.high52_score,
-                momentum_score    = EXCLUDED.momentum_score,
-                total_score       = EXCLUDED.total_score,
-                rank              = EXCLUDED.rank,
-                market_regime     = EXCLUDED.market_regime
+                rsi_score             = EXCLUDED.rsi_score,
+                macd_score            = EXCLUDED.macd_score,
+                bb_score              = EXCLUDED.bb_score,
+                technical_score       = EXCLUDED.technical_score,
+                per_score             = EXCLUDED.per_score,
+                pbr_score             = EXCLUDED.pbr_score,
+                roe_score             = EXCLUDED.roe_score,
+                debt_score            = EXCLUDED.debt_score,
+                fundamental_score     = EXCLUDED.fundamental_score,
+                volume_score          = EXCLUDED.volume_score,
+                inst_score            = EXCLUDED.inst_score,
+                high52_score          = EXCLUDED.high52_score,
+                momentum_score        = EXCLUDED.momentum_score,
+                total_score           = EXCLUDED.total_score,
+                rank                  = EXCLUDED.rank,
+                market_regime         = EXCLUDED.market_regime,
+                macro_adjustment      = EXCLUDED.macro_adjustment,
+                adjusted_total_score  = EXCLUDED.adjusted_total_score
         """
         with DBConnection() as conn:
             with conn.cursor() as cur:
@@ -459,6 +463,72 @@ class StockRepository:
         with DBConnection() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, data)
+
+    # ------------------------------------------------------------------
+    # 거시경제 지표 (STEP A~C 고도화)
+    # ------------------------------------------------------------------
+
+    def upsert_macro_indicator(self, row: dict) -> None:
+        """macro_indicators 테이블 UPSERT. row 키: date, indicator_code, value"""
+        sql = """
+            INSERT INTO macro_indicators (date, indicator_code, value)
+            VALUES (%(date)s, %(indicator_code)s, %(value)s)
+            ON CONFLICT (date, indicator_code) DO UPDATE SET
+                value = EXCLUDED.value
+        """
+        with DBConnection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, row)
+        logger.debug(f"macro_indicators upsert | {row['indicator_code']} {row['date']}")
+
+    def get_macro_indicator(
+        self, indicator_code: str, lookback_days: int, as_of_date: str | None = None
+    ) -> pd.DataFrame:
+        """macro_indicators에서 최근 N일 데이터 반환. 컬럼: date, value (오름차순).
+
+        as_of_date 지정 시 해당 날짜 이전 데이터만 반환 (백테스트 look-ahead bias 방지).
+        None이면 오늘 기준.
+        """
+        if as_of_date:
+            sql = """
+                SELECT date, value
+                FROM macro_indicators
+                WHERE indicator_code = %s
+                  AND date <= %s
+                  AND date >= %s::date - (%s * INTERVAL '1 day')
+                ORDER BY date ASC
+            """
+            params = (indicator_code, as_of_date, as_of_date, lookback_days)
+        else:
+            sql = """
+                SELECT date, value
+                FROM macro_indicators
+                WHERE indicator_code = %s
+                  AND date >= CURRENT_DATE - (%s * INTERVAL '1 day')
+                ORDER BY date ASC
+            """
+            params = (indicator_code, lookback_days)
+        with DBConnection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+        if not rows:
+            return pd.DataFrame(columns=["date", "value"])
+        return pd.DataFrame([dict(r) for r in rows])
+
+    def get_latest_macro_indicator(self, indicator_code: str) -> float | None:
+        """macro_indicators에서 가장 최근 값 1건 반환."""
+        sql = """
+            SELECT value FROM macro_indicators
+            WHERE indicator_code = %s
+            ORDER BY date DESC
+            LIMIT 1
+        """
+        with DBConnection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (indicator_code,))
+                row = cur.fetchone()
+                return float(row[0]) if row else None
 
     def get_recommendation_returns(self, recommendation_id: int) -> list[dict]:
         """특정 추천의 수익률 기록 반환."""

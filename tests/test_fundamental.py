@@ -29,12 +29,17 @@ def _make_sector_fin(pers: list[float], pbrs=None, roes=None, debt_ratios=None) 
 
 class TestPerScore:
     def test_lowest_per_in_sector_gives_high_score(self, scorer):
-        """섹터 내 PER 최저 종목 → per_score ≥ 90."""
+        """섹터 내 PER 최저 종목 → per_score ≥ 80.
+
+        scipy percentileofscore(kind='rank')는 해당 값이 몇 번째 백분위인지를
+        '포함' 기준으로 계산한다. 6개 종목 중 1등(최저 PER)이면 100*(1/6)=16.67
+        percentile → per_score = 100 - 16.67 = 83.33.
+        """
         sector_fin = _make_sector_fin([5.0, 10.0, 15.0, 20.0, 25.0, 30.0])
         all_fin = sector_fin.copy()
         fin = {"per": 5.0}  # 최저 PER
         result = scorer.score("TEST", financials=fin, sector_financials=sector_fin, all_financials=all_fin)
-        assert result.per_score >= 90.0, f"per_score={result.per_score}"
+        assert result.per_score >= 80.0, f"per_score={result.per_score}"
 
     def test_highest_per_in_sector_gives_low_score(self, scorer):
         """섹터 내 PER 최고 종목 → per_score 낮음."""
@@ -114,8 +119,10 @@ class TestFundamentalScore:
         assert 0.0 <= result.fundamental_score <= 100.0
 
     def test_empty_financials_returns_neutral(self, scorer):
-        """재무 데이터 없음 → fundamental_score = 50.0."""
+        """재무 데이터 없음 → fundamental_score = DEFAULT 가중 평균.
+
+        기본값: per=30(w=0.30), pbr=30(w=0.25), roe=30(w=0.30), debt=50(w=0.15)
+        가중 평균 = 30*0.30 + 30*0.25 + 30*0.30 + 50*0.15 = 9+7.5+9+7.5 = 33.0
+        """
         result = scorer.score("TEST", financials={})
-        assert result.fundamental_score == pytest.approx(
-            (30.0 + 30.0 + 30.0 + 50.0) / 4, abs=0.1
-        )
+        assert result.fundamental_score == pytest.approx(33.0, abs=0.1)

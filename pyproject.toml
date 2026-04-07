@@ -37,6 +37,7 @@ loguru = "*"
 
 # 알림
 requests = "*"
+# ecos 패키지는 수치최적화 solver로 ECOS API와 무관 — requests로 직접 호출
 
 [tool.poetry.group.dev.dependencies]
 pytest = "*"

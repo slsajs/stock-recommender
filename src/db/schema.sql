@@ -115,6 +115,27 @@ CREATE TABLE IF NOT EXISTS index_prices (
 );
 
 -- ============================================
+-- [고도화] 거시경제 지표 (STEP A~C)
+-- ============================================
+CREATE TABLE IF NOT EXISTS macro_indicators (
+    date            DATE          NOT NULL,
+    indicator_code  VARCHAR(30)   NOT NULL,   -- 'BASE_RATE', 'USD_KRW', 'KTB_10Y', 'CPI_YOY'
+    value           NUMERIC(12,4) NOT NULL,
+    PRIMARY KEY (date, indicator_code)
+);
+
+-- ============================================
+-- [고도화] 미국 시장 지수 (STEP D)
+-- ============================================
+CREATE TABLE IF NOT EXISTS us_market_prices (
+    index_code      VARCHAR(10)   NOT NULL,   -- 'SPX' = S&P500, 'IXIC' = 나스닥
+    date            DATE          NOT NULL,
+    close           NUMERIC(12,2) NOT NULL,
+    change_pct      NUMERIC(8,4),             -- 전일 대비 변동률 (%)
+    PRIMARY KEY (index_code, date)
+);
+
+-- ============================================
 -- 스코어링 결과
 -- ============================================
 CREATE TABLE IF NOT EXISTS stock_scores (
@@ -135,7 +156,12 @@ CREATE TABLE IF NOT EXISTS stock_scores (
     momentum_score    NUMERIC(5,2),
     total_score       NUMERIC(5,2) NOT NULL,
     rank              SMALLINT,
-    market_regime     VARCHAR(10),
+    market_regime     VARCHAR(20),
+    -- [고도화] 보정값 컬럼 (STEP B~F에서 채워짐, 기본 0)
+    macro_adjustment        NUMERIC(5,2) DEFAULT 0,  -- 환율·미국시장 보정 (STEP B, D)
+    disclosure_adjustment   NUMERIC(5,2) DEFAULT 0,  -- 공시 감성 보정 (STEP E)
+    news_adjustment         NUMERIC(5,2) DEFAULT 0,  -- 뉴스 감성 보정 (STEP F)
+    adjusted_total_score    NUMERIC(5,2),             -- total_score + 보정값 합계
     PRIMARY KEY (code, date)
 );
 

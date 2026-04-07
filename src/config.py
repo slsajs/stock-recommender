@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     # DART API
     dart_api_key: str = ""
 
+    # ECOS API (한국은행 경제통계 — STEP A~C 고도화)
+    ecos_api_key: str = ""
+
     # Slack
     slack_webhook_url: str = ""
 
