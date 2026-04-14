@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date as date_cls, datetime
 from typing import Any
 
 import pandas as pd
@@ -295,12 +296,18 @@ class StockRepository:
     # ------------------------------------------------------------------
 
     def get_recent_disclosures(self, code: str, days: int = 30, as_of_date: str | None = None) -> list[dict]:
+        """
+        최근 N일 이내 공시 목록을 반환한다.
+
+        반환 dict에는 'days_ago' 키가 추가된다 (as_of_date 또는 오늘 기준).
+        disclosure_scorer.disclosure_adjustment() 에서 시간 감쇠 가중치 계산에 사용한다.
+        """
         if as_of_date:
             sql = """
                 SELECT * FROM disclosures
                 WHERE code = %s
                   AND disclosed_at <= %s
-                  AND disclosed_at >= %s::date - INTERVAL '%s days'
+                  AND disclosed_at >= %s::date - (%s * INTERVAL '1 day')
                 ORDER BY disclosed_at DESC
             """
             params = (code, as_of_date, as_of_date, days)
@@ -308,14 +315,52 @@ class StockRepository:
             sql = """
                 SELECT * FROM disclosures
                 WHERE code = %s
-                  AND disclosed_at >= NOW() - INTERVAL '%s days'
+                  AND disclosed_at >= CURRENT_DATE - (%s * INTERVAL '1 day')
                 ORDER BY disclosed_at DESC
             """
             params = (code, days)
+
         with DBConnection() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(sql, params)
-                return [dict(r) for r in cur.fetchall()]
+                rows = [dict(r) for r in cur.fetchall()]
+
+        # days_ago 계산 (시간 감쇠 가중치용)
+        ref_date = date_cls.fromisoformat(as_of_date) if as_of_date else date_cls.today()
+        for row in rows:
+            disclosed_at = row.get("disclosed_at")
+            if isinstance(disclosed_at, datetime):
+                disc_date = disclosed_at.date()
+            elif isinstance(disclosed_at, date_cls):
+                disc_date = disclosed_at
+            else:
+                disc_date = ref_date
+            row["days_ago"] = max(0, (ref_date - disc_date).days)
+
+        return rows
+
+    def batch_update_disclosure_sentiments(self, updates: dict[str, float]) -> None:
+        """
+        공시별 sentiment_score를 배치 업데이트한다.
+
+        STEP E 스코어링 완료 후 disclosures.sentiment_score 컬럼에 결과를 기록한다.
+
+        Args:
+            updates: {dart_rcp_no: sentiment_score} 형태의 dict.
+                     sentiment_score 범위: -1.0 ~ +1.0
+        """
+        if not updates:
+            return
+        sql = """
+            UPDATE disclosures
+            SET sentiment_score = %s
+            WHERE dart_rcp_no = %s
+        """
+        rows = [(score, rcp_no) for rcp_no, score in updates.items()]
+        with DBConnection() as conn:
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_batch(cur, sql, rows, page_size=200)
+        logger.debug(f"disclosures sentiment_score 업데이트 {len(updates)}건")
 
     def upsert_disclosure(self, disc: dict) -> None:
         sql = """
@@ -360,15 +405,17 @@ class StockRepository:
             INSERT INTO stock_scores
                 (code, date, rsi_score, macd_score, bb_score, technical_score,
                  per_score, pbr_score, roe_score, debt_score, fundamental_score,
-                 volume_score, inst_score, high52_score, momentum_score,
+                 volume_score, inst_score, high52_score, price_momentum_score, momentum_score,
                  total_score, rank, market_regime,
-                 macro_adjustment, adjusted_total_score)
+                 macro_adjustment, disclosure_adjustment, news_adjustment,
+                 adjusted_total_score)
             VALUES
                 (%(code)s, %(date)s, %(rsi_score)s, %(macd_score)s, %(bb_score)s, %(technical_score)s,
                  %(per_score)s, %(pbr_score)s, %(roe_score)s, %(debt_score)s, %(fundamental_score)s,
-                 %(volume_score)s, %(inst_score)s, %(high52_score)s, %(momentum_score)s,
+                 %(volume_score)s, %(inst_score)s, %(high52_score)s, %(price_momentum_score)s, %(momentum_score)s,
                  %(total_score)s, %(rank)s, %(market_regime)s,
-                 %(macro_adjustment)s, %(adjusted_total_score)s)
+                 %(macro_adjustment)s, %(disclosure_adjustment)s, %(news_adjustment)s,
+                 %(adjusted_total_score)s)
             ON CONFLICT (code, date) DO UPDATE SET
                 rsi_score             = EXCLUDED.rsi_score,
                 macd_score            = EXCLUDED.macd_score,
@@ -382,11 +429,14 @@ class StockRepository:
                 volume_score          = EXCLUDED.volume_score,
                 inst_score            = EXCLUDED.inst_score,
                 high52_score          = EXCLUDED.high52_score,
+                price_momentum_score  = EXCLUDED.price_momentum_score,
                 momentum_score        = EXCLUDED.momentum_score,
                 total_score           = EXCLUDED.total_score,
                 rank                  = EXCLUDED.rank,
                 market_regime         = EXCLUDED.market_regime,
                 macro_adjustment      = EXCLUDED.macro_adjustment,
+                disclosure_adjustment = EXCLUDED.disclosure_adjustment,
+                news_adjustment       = EXCLUDED.news_adjustment,
                 adjusted_total_score  = EXCLUDED.adjusted_total_score
         """
         with DBConnection() as conn:
@@ -529,6 +579,84 @@ class StockRepository:
                 cur.execute(sql, (indicator_code,))
                 row = cur.fetchone()
                 return float(row[0]) if row else None
+
+    # ------------------------------------------------------------------
+    # 백테스트 집계 (인사이트 생성용)
+    # ------------------------------------------------------------------
+
+    def get_backtest_joined_data(
+        self,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> pd.DataFrame:
+        """
+        recommendation_returns / recommendations / stock_scores / stocks 를
+        JOIN하여 집계용 원본 DataFrame을 반환한다.
+
+        반환 컬럼:
+            recommendation_id, date, code, rank, total_score,
+            market_regime, sector,
+            days_after, return_rate, benchmark_rate
+
+        Args:
+            start_date: 추천일 필터 시작 (None=전체)
+            end_date:   추천일 필터 종료 (None=전체)
+        """
+        date_clauses: list[str] = []
+        params: list = []
+
+        if start_date:
+            date_clauses.append("r.date >= %s")
+            params.append(start_date)
+        if end_date:
+            date_clauses.append("r.date <= %s")
+            params.append(end_date)
+
+        where_extra = ""
+        if date_clauses:
+            where_extra = " AND " + " AND ".join(date_clauses)
+
+        query = f"""
+            SELECT
+                rr.recommendation_id,
+                r.date,
+                r.code,
+                r.rank,
+                ss.total_score,
+                ss.market_regime,
+                st.sector,
+                rr.days_after,
+                rr.return_rate,
+                rr.benchmark_rate
+            FROM recommendation_returns rr
+            JOIN recommendations r  ON rr.recommendation_id = r.id
+            LEFT JOIN stock_scores  ss ON ss.code = r.code AND ss.date = r.date
+            LEFT JOIN stocks        st ON st.code = r.code
+            WHERE rr.return_rate IS NOT NULL
+            {where_extra}
+            ORDER BY r.date ASC, r.rank ASC, rr.days_after ASC
+        """
+        with DBConnection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(query, params or None)
+                rows = cur.fetchall()
+
+        if not rows:
+            return pd.DataFrame(
+                columns=[
+                    "recommendation_id", "date", "code", "rank", "total_score",
+                    "market_regime", "sector",
+                    "days_after", "return_rate", "benchmark_rate",
+                ]
+            )
+        df = pd.DataFrame([dict(r) for r in rows])
+        df["date"] = pd.to_datetime(df["date"]).dt.date.astype(str)
+        # PostgreSQL NUMERIC 타입이 decimal.Decimal로 반환됨 → float으로 변환
+        # pandas 산술 연산(.std, .mean 등)에서 TypeError 방지
+        for col in ("return_rate", "benchmark_rate", "total_score"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
 
     def get_recommendation_returns(self, recommendation_id: int) -> list[dict]:
         """특정 추천의 수익률 기록 반환."""

@@ -39,6 +39,10 @@ from src.db.connection import close_pool, init_pool
 from src.db.repository import StockRepository
 from src.scoring.aggregator import ScoreAggregator
 from src.scoring.base import ScoreResult
+from src.scoring.disclosure_scorer import (
+    disclosure_adjustment,
+    score_single_disclosure,
+)
 from src.scoring.filters import should_exclude
 from src.scoring.fundamental import FundamentalScorer
 from src.scoring.macro_adjuster import (
@@ -236,10 +240,14 @@ def run_daily(target_date: str | None = None) -> None:
     logger.info(f"재무 데이터 캐시 | 전체={len(all_fin)}건, 섹터={len(sector_fin_map)}개")
 
     # ------------------------------------------------------------------
-    # 3. 대상 종목 풀
+    # 3. 대상 종목 풀 + 섹터 맵 (루프 밖 1회 — 성능 필수)
     # ------------------------------------------------------------------
     all_stocks = repo.get_all_stocks()
     target_pool = [s["code"] for s in all_stocks]
+    # {code: sector} 맵 — 섹터 집중도 제한(aggregator)과 환율 보정(STEP B)에서 사용
+    sector_map: dict[str, str] = {
+        s["code"]: (s.get("sector") or "기타") for s in all_stocks
+    }
     logger.info(f"대상 종목 수: {len(target_pool)}")
 
     # ------------------------------------------------------------------
@@ -247,10 +255,15 @@ def run_daily(target_date: str | None = None) -> None:
     # ------------------------------------------------------------------
     code_results: dict[str, ScoreResult | Exception] = {}
 
+    # [STEP E] 공시 sentiment_score 배치 업데이트용 (dart_rcp_no → sentiment)
+    disc_sentiment_updates: dict[str, float] = {}
+
     for code in target_pool:
         try:
-            # 필터 검사
-            excluded, reason = should_exclude(code, repo, as_of_date=today)
+            # 필터 검사 (개선 D-1: regime 전달로 BULL 구간 RSI 필터 활성화)
+            excluded, reason = should_exclude(
+                code, repo, as_of_date=today, regime=regime.regime
+            )
             if excluded:
                 logger.debug(f"제외 | code={code} | {reason}")
                 continue
@@ -280,6 +293,25 @@ def run_daily(target_date: str | None = None) -> None:
             # macro_adj = currency_adjustment(sector, usd_krw_change)
             macro_adj = 0.0
 
+            # [STEP E] 공시 감성 보정값
+            # 백테스트 결과: disc_adj로 진입한 종목 avg_alpha=+0.33 < 기존 top5 avg_alpha=+0.45
+            # 자기주식취득결정(+8.0)이 하위 종목을 상위권으로 끌어올려 오히려 분산만 키움
+            # → 비활성화 (DB 저장/sentiment_score 업데이트는 유지, 순위에만 미반영)
+            recent_discs = repo.get_recent_disclosures(code, days=30, as_of_date=today)
+            disc_adj = 0.0  # disclosure_adjustment(recent_discs)
+
+            # 공시별 sentiment_score 수집 (배치 DB 업데이트용)
+            for disc in recent_discs:
+                rcp_no = disc.get("dart_rcp_no")
+                if not rcp_no:
+                    continue
+                sentiment = score_single_disclosure(
+                    disc.get("category", ""),
+                    disc.get("title", ""),
+                )
+                if sentiment != 0.0:
+                    disc_sentiment_updates[rcp_no] = sentiment
+
             # 합산 ScoreResult 조립
             combined = ScoreResult(
                 code=code,
@@ -294,9 +326,10 @@ def run_daily(target_date: str | None = None) -> None:
                 fundamental_score=fund.fundamental_score,
                 volume_score=mom.volume_score,
                 inst_score=mom.inst_score,
-                high52_score=mom.high52_score,
+                price_momentum_score=mom.price_momentum_score,
                 momentum_score=mom.momentum_score,
-                macro_adjustment=macro_adj,  # [STEP B]
+                macro_adjustment=macro_adj,       # [STEP B]
+                disclosure_adjustment=disc_adj,   # [STEP E]
             )
             code_results[code] = combined
 
@@ -304,10 +337,18 @@ def run_daily(target_date: str | None = None) -> None:
             logger.warning(f"스코어링 스킵 | code={code} | reason={e}")
             code_results[code] = e
 
+    # [STEP E] 공시 sentiment_score 배치 업데이트 (루프 종료 후 1회)
+    if disc_sentiment_updates:
+        try:
+            repo.batch_update_disclosure_sentiments(disc_sentiment_updates)
+            logger.info(f"공시 sentiment_score 업데이트 | {len(disc_sentiment_updates)}건")
+        except Exception as e:
+            logger.warning(f"공시 sentiment_score 업데이트 실패 (스코어링은 정상 진행): {e}")
+
     # ------------------------------------------------------------------
     # 5. 집계 → Top 5 → DB 저장
     # ------------------------------------------------------------------
-    top5 = aggregator.run(code_results, regime)
+    top5 = aggregator.run(code_results, regime, sector_map=sector_map)
     if not top5:
         logger.error("추천 종목 없음 — 파이프라인 종료")
         return
@@ -316,7 +357,7 @@ def run_daily(target_date: str | None = None) -> None:
     for r in top5:
         logger.info(
             f"  #{r.rank} {r.code} | 총점={r.total_score} → 보정후={r.adjusted_total_score} "
-            f"(macro={r.macro_adjustment:+.2f}) "
+            f"(macro={r.macro_adjustment:+.2f}, disc={r.disclosure_adjustment:+.2f}) "
             f"| tech={r.technical_score} fund={r.fundamental_score} mom={r.momentum_score}"
         )
         repo.save_stock_score(
@@ -334,13 +375,16 @@ def run_daily(target_date: str | None = None) -> None:
                 "fundamental_score": r.fundamental_score,
                 "volume_score": r.volume_score,
                 "inst_score": r.inst_score,
-                "high52_score": r.high52_score,
+                "high52_score": r.high52_score,           # deprecated — always None
+                "price_momentum_score": r.price_momentum_score,
                 "momentum_score": r.momentum_score,
                 "total_score": r.total_score,
                 "rank": r.rank,
                 "market_regime": r.market_regime,
-                "macro_adjustment": r.macro_adjustment,          # [STEP B]
-                "adjusted_total_score": r.adjusted_total_score,  # [STEP B]
+                "macro_adjustment": r.macro_adjustment,           # [STEP B]
+                "disclosure_adjustment": r.disclosure_adjustment, # [STEP E]
+                "news_adjustment": r.news_adjustment,             # [STEP F - 현재 0.0]
+                "adjusted_total_score": r.adjusted_total_score,
             }
         )
         repo.save_recommendation(

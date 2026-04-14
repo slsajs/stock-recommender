@@ -1,0 +1,2 @@
+2026-04-02 10:03:57.749 | INFO     | src.db.connection:init_pool:22 - DB 커넥션 풀 초기화 완료 (min=1, max=10)
+2026-04-02 10:03:57.759 | INFO     | __main__:main:215 - 스케줄러 시작 | 매일 16:30 KST 실행

@@ -36,6 +36,12 @@ class Settings(BaseSettings):
     schedule_hour: int = 16
     schedule_minute: int = 30
 
+    # Qwen3 로컬 LLM (Ollama)
+    llm_base_url: str = "http://localhost:11434"
+    llm_model: str = "qwen3"
+    llm_timeout: int = 15
+    llm_enabled: bool = True
+
     @property
     def db_dsn(self) -> str:
         return (

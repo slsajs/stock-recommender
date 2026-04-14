@@ -37,7 +37,8 @@ class ScoreResult:
     # 모멘텀 (0~100)
     volume_score: float | None = None
     inst_score: float | None = None
-    high52_score: float | None = None
+    high52_score: float | None = None          # deprecated — 항상 None (방향 B 이후)
+    price_momentum_score: float | None = None  # 60거래일 가격 모멘텀 (방향 B)
     momentum_score: float | None = None
 
     # 최종

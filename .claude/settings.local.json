@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(PYTHONUTF8=1 poetry run python -c \"import pykrx; print\\(pykrx.__version__\\)\")",
+      "Bash(poetry run:*)",
+      "Bash(PYTHONUTF8=1 poetry run pip index versions pykrx)",
+      "Bash(PYTHONUTF8=1 poetry run:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(docker exec stock-db psql -U postgres -d stock_recommender -c ':*)",
+      "Bash(docker exec stock-db:*)"
+    ]
+  }
+}

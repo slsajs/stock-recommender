@@ -25,24 +25,29 @@
 8. [백테스트](#백테스트)
 9. [고도화 — STEP A: 금리 트렌드 기반 재무 가중치 조절](#고도화--step-a-금리-트렌드-기반-재무-가중치-조절)
 10. [고도화 — STEP B: 환율 → 섹터별 점수 보정](#고도화--step-b-환율--섹터별-점수-보정)
-11. [섹터 데이터 수집 가이드](#섹터-데이터-수집-가이드)
-12. [프로젝트 구조](#프로젝트-구조)
-13. [트러블슈팅](#트러블슈팅)
+11. [고도화 — STEP E: 공시 감성 보정](#고도화--step-e-공시-감성-보정)
+12. [섹터 데이터 수집 가이드](#섹터-데이터-수집-가이드)
+13. [프로젝트 구조](#프로젝트-구조)
+14. [트러블슈팅](#트러블슈팅)
 
 ---
 
 ## 핵심 공식
 
 ```
-최종점수 = 기술점수(가변%) + 재무점수(40%) + 모멘텀점수(가변%)
+최종점수 = 재무점수(가변%) + 모멘텀점수(가변%)
+
+adjusted_total_score = total_score + macro_adjustment + disclosure_adjustment + news_adjustment
 ```
+
+> **방향 B 설계 변경**: 백테스트 alpha 분석에서 기술적 지표(RSI/MACD/BB)가 음의 상관계수(-0.055~-0.082)를 보여 가중치에서 제외했습니다. 재무점수 + 모멘텀점수만 사용합니다.
 
 **도메인 가중치 — Market Regime에 따라 동적 결정**
 
-| 시장 상태 | 기술점수 | 재무점수 | 모멘텀점수 |
+| 시장 상태 | 재무점수 | 모멘텀점수 | 비고 |
 |---|---|---|---|
-| BULL (MA20 > MA60) | 20% | 40% | 40% |
-| BEAR (MA20 ≤ MA60) | 45% | 40% | 15% |
+| BULL (MA20 > MA60) | 35% | 65% | 추세 상승장 — 모멘텀 집중 |
+| BEAR (MA20 ≤ MA60) | 45% | 55% | 방어적 하락장 — 재무 비중 ↑ |
 
 **재무점수 내부 가중치 — [STEP A] 금리 트렌드에 따라 동적 결정**
 
@@ -65,6 +70,21 @@
 > 섹터 정보(`stocks.sector`)가 NULL인 종목은 보정값 0.0으로 처리됩니다.
 > 섹터 데이터 수집 방법은 [섹터 데이터 수집 가이드](#섹터-데이터-수집-가이드)를 참고하세요.
 
+**공시 감성 보정 — [STEP E] 최근 30일 DART 공시 카테고리·제목 키워드 기반**
+
+| 공시 유형 | 예시 | 감성 점수 | 보정 범위 |
+|---|---|---|---|
+| 자기주식취득결정 | 자사주 매입 공시 | +0.8 | |
+| 무상증자결정 | 무상증자 공시 | +0.7 | |
+| 유상증자결정 | 유상증자 공시 | -0.7 | |
+| 관리종목지정 | 관리종목 지정 | -0.9 | |
+| 실적 키워드 | 흑자전환, 사상최대 | ±0.7~0.8 | |
+
+보정값 = 시간 감쇠 가중 평균(오늘=1.0, 30일 전=0.1) × 10, **-10.0 ~ +10.0** 클리핑
+
+> DART_API_KEY 설정 및 공시 수집 완료 시 자동으로 적용됩니다.
+> 미적용 시 `disclosure_adjustment = 0.0`으로 처리됩니다.
+
 ---
 
 ## 구현 현황
@@ -85,11 +105,12 @@
 
 | STEP | 내용 | 상태 |
 |---|---|---|
+| 방향 B | 모멘텀 팩터 재설계: 52주 신고가 → 60일 가격 모멘텀, 기술 가중치 → 0 | 완료 |
 | STEP A | 금리 트렌드 → FundamentalScorer 내부 가중치 동적 조절 | 완료 |
 | STEP B | 환율 → 섹터별 점수 보정 | 완료 |
 | STEP C | 장단기 금리차 → Market Regime 보강 | 미구현 |
 | STEP D | 미국 시장 급락 → 추천 보류 | 미구현 |
-| STEP E | 공시 감성 (규칙 기반) 보정 | 미구현 |
+| STEP E | 공시 감성 (규칙 기반) 보정 | 완료 |
 | STEP F | 뉴스 감성 보정 | 미구현 |
 
 ---
@@ -670,18 +691,20 @@ poetry run pytest tests/test_momentum.py -v
 poetry run pytest tests/test_market_regime.py -v
 poetry run pytest tests/test_filters.py -v
 poetry run pytest tests/test_aggregator.py -v
-poetry run pytest tests/test_macro_adjuster.py -v    # [STEP A]
+poetry run pytest tests/test_macro_adjuster.py -v       # [STEP A, B]
+poetry run pytest tests/test_disclosure_scorer.py -v    # [STEP E]
 ```
 
 | 테스트 파일 | 주요 케이스 |
 |---|---|
 | `test_technical.py` | RSI ≤ 30 → 70점 이상, RSI ≥ 70 → 30점 이하, 데이터 5일 미만 → 50.0 |
 | `test_fundamental.py` | 섹터 내 PER 최저 → 높은 점수, 섹터 5개 미만 → 전체 폴백, PER 음수/None → 30.0 |
-| `test_momentum.py` | 거래량 5배 급증 → 100점, 데이터 없음 → 50.0, 52주 신고가 → 100점 |
-| `test_market_regime.py` | MA20 > MA60 → BULL + 모멘텀 0.40, MA20 < MA60 → BEAR + 기술 0.45 |
+| `test_momentum.py` | 거래량 5배 급증 → 100점, 60일 수익률 +20% → 80점 이상, 데이터 없음 → 50.0, 가중치 합 = 1.0 |
+| `test_market_regime.py` | MA20 > MA60 → BULL + 모멘텀 0.65, MA20 < MA60 → BEAR + 재무 0.45, 기술 가중치 = 0.0 |
 | `test_filters.py` | 상장 60일 미만 → 제외, 5일 거래량 0 → 제외, 관리종목 공시 → 제외 |
 | `test_aggregator.py` | 가중합·순위 계산, 실패율 30% 초과 → 추천 중단 |
 | `test_macro_adjuster.py` | [STEP A] 금리 0.5%p 상승 → RISING, 가중치 합 = 1.0 / [STEP B] 수출 섹터+환율 상승 → +보정, 클리핑 ±5.0 |
+| `test_disclosure_scorer.py` | [STEP E] 자기주식취득 → +0.8, 유상증자 → -0.7, 최근 악재 > 오래된 호재, 클리핑 ±10.0 |
 
 ---
 
@@ -899,6 +922,176 @@ ORDER BY avg_macro_adj DESC;
 
 > STEP B를 비활성화하려면 `main.py`에서 `currency_adjustment()` 호출 결과를 0.0으로 고정하거나
 > `macro_adjuster.py`의 `currency_adjustment()`가 항상 `0.0`을 반환하도록 임시 변경하세요.
+
+---
+
+## 고도화 — STEP E: 공시 감성 보정
+
+### 개요
+
+DART에서 수집한 공시의 **카테고리**와 **제목 키워드**를 규칙 기반으로 분석하여 종목별 감성 보정값을 산출합니다.
+NLP 모델 없이 사전 매핑만으로 동작하므로 외부 의존성이 없고 실시간 처리가 가능합니다.
+
+- **호재 공시**: 자기주식취득, 무상증자 등 → 최종 점수 가점 (최대 +10)
+- **악재 공시**: 유상증자, 관리종목지정, 회생절차 등 → 최종 점수 감점 (최대 -10)
+- **시간 감쇠**: 최근 공시일수록 가중치가 높음 (오늘=1.0, 30일 전=0.1)
+
+### 카테고리별 감성 점수 사전
+
+| 카테고리 | 감성 점수 | 배경 |
+|---|---|---|
+| 자기주식취득결정 | +0.8 | 자사주 매입 → 주주환원 신호 |
+| 무상증자결정 | +0.7 | 기존 주주 추가 주식 지급 |
+| 주식배당결정 | +0.6 | 배당 지급 |
+| 타법인주식취득 | +0.5 | M&A, 사업 확장 |
+| 유상증자결정 | -0.7 | 지분 희석 |
+| 전환사채권발행 | -0.5 | 잠재적 지분 희석 |
+| 감자결정 | -0.8 | 주식 수 감소 |
+| 관리종목지정 | -0.9 | 상장 위험 신호 |
+| 회생절차·영업정지·상장폐지 | -1.0 | 치명적 위험 |
+
+### 제목 키워드 감성 점수
+
+| 키워드 | 감성 점수 |
+|---|---|
+| 흑자전환, 사상최대, 최대실적 | +0.7 ~ +0.8 |
+| 영업이익증가, 매출액증가 | +0.4 ~ +0.6 |
+| 적자전환 | -0.8 |
+| 영업이익감소, 매출액감소 | -0.4 ~ -0.6 |
+
+> 카테고리와 제목 키워드가 동시에 매칭되면 합산 후 -1.0 ~ +1.0으로 클리핑합니다.
+> 제목은 첫 번째 매칭 키워드만 반영합니다.
+
+### 보정값 산출 공식
+
+```
+avg_sentiment = Σ(sentiment_i × time_weight_i) / Σ(time_weight_i)
+time_weight   = max(0.1, 1.0 - days_ago / 30 × 0.9)   # 오늘=1.0, 30일 전=0.1
+disclosure_adjustment = clip(avg_sentiment × 10, -10, +10)
+```
+
+### 파이프라인 내 동작 위치
+
+```
+run_daily()
+  ├── [1] Market Regime 판단
+  ├── [1-b] 금리 트렌드 판단 (STEP A)
+  ├── [1-c] 환율 변동률 계산 (STEP B)
+  ├── [2] 재무 데이터 캐시
+  └── [4] 종목별 스코어링
+           ├── TechnicalScorer / FundamentalScorer / MomentumScorer
+           ├── disclosure_adjustment(recent_discs)   ← STEP E (공시 보정값)
+           └── ScoreResult.disclosure_adjustment = disc_adj
+                  ↓
+  aggregator.aggregate()
+    adjusted_total_score = total_score + macro_adj + disclosure_adj + news_adj
+
+  [루프 종료 후]
+  repo.batch_update_disclosure_sentiments(...)        ← disclosures.sentiment_score 업데이트
+```
+
+### 로그 확인
+
+STEP E가 적용되면 다음 로그가 출력됩니다:
+
+```
+2024-01-15 16:33:12 | DEBUG | 공시 보정 | 유효=2건 avg_sentiment=-0.412 → adjustment=-4.12
+2024-01-15 16:35:10 | INFO  | #1 005380 | 총점=83.45 → 보정후=79.33 (macro=+0.00, disc=-4.12)
+2024-01-15 16:35:25 | INFO  | 공시 sentiment_score 업데이트 | 47건
+```
+
+공시 데이터가 없거나 중립 공시만 있을 경우:
+
+```
+2024-01-15 16:33:12 | DEBUG | 공시 보정 | 유효=0건 avg_sentiment=0.000 → adjustment=+0.00
+```
+
+### 수동으로 공시 보정값 확인
+
+```powershell
+poetry run python -c "
+from src.utils.logger import setup_logger
+from src.db.connection import init_pool, close_pool
+from src.db.repository import StockRepository
+from src.scoring.disclosure_scorer import disclosure_adjustment
+setup_logger()
+init_pool()
+repo = StockRepository()
+code = '005380'  # 현대차 예시
+discs = repo.get_recent_disclosures(code, days=30)
+adj = disclosure_adjustment(discs)
+print(f'{code} 공시 보정값: {adj:+.2f}')
+print(f'공시 건수: {len(discs)}건')
+for d in discs:
+    print(f'  [{d[\"days_ago\"]}일 전] {d[\"category\"]} — {d[\"title\"][:50]}')
+close_pool()
+"
+```
+
+### 백테스트로 STEP E 효과 검증
+
+```sql
+-- psql에서 실행 — STEP E 적용 종목의 성과 확인
+SELECT
+  AVG(ss.disclosure_adjustment)                          AS avg_disc_adj,
+  AVG(rr.return_rate - rr.benchmark_rate)                AS avg_alpha,
+  COUNT(*)                                               AS sample_count
+FROM stock_scores ss
+JOIN recommendations r ON r.code = ss.code AND r.date = ss.date
+JOIN recommendation_returns rr ON rr.recommendation_id = r.id
+WHERE rr.days_after = 20
+  AND ss.disclosure_adjustment != 0;
+```
+
+```sql
+-- 공시 보정이 적용된 날의 추천 vs 미적용 날 alpha 비교
+SELECT
+  CASE WHEN ABS(ss.disclosure_adjustment) > 0 THEN '보정 있음' ELSE '보정 없음' END AS group_label,
+  AVG(rr.return_rate - rr.benchmark_rate) AS avg_alpha,
+  COUNT(*) AS cnt
+FROM stock_scores ss
+JOIN recommendations r ON r.code = ss.code AND r.date = ss.date
+JOIN recommendation_returns rr ON rr.recommendation_id = r.id
+WHERE rr.days_after = 20
+GROUP BY group_label;
+```
+
+> STEP E를 비활성화하려면 `main.py`의 `disclosure_adjustment()` 호출 결과를 0.0으로 고정하세요:
+>
+> ```python
+> # disc_adj = disclosure_adjustment(recent_discs)
+> disc_adj = 0.0
+> ```
+
+### 선행 조건
+
+STEP E가 실질적으로 동작하려면 `disclosures` 테이블에 데이터가 있어야 합니다.
+
+```powershell
+# 공시 데이터 수집 (DART_API_KEY 필요)
+poetry run python -c "
+from src.utils.logger import setup_logger
+from src.db.connection import init_pool, close_pool
+from src.db.repository import StockRepository
+from src.collector.disclosure_collector import DisclosureCollector
+setup_logger()
+init_pool()
+repo = StockRepository()
+DisclosureCollector(repo).run('2024-01-01', '2024-12-31')
+close_pool()
+"
+```
+
+공시 수집 후 카테고리 분포 확인:
+
+```powershell
+docker exec -it stock-db psql -U postgres -d stock_recommender -c "
+SELECT category, COUNT(*) AS cnt
+FROM disclosures
+GROUP BY category
+ORDER BY cnt DESC;
+"
+```
 
 ---
 
@@ -1120,7 +1313,7 @@ stock-recommender/
 │   │   ├── filters.py            # 추천 제외 필터
 │   │   ├── technical.py          # RSI, MACD, 볼린저밴드 (역추세)
 │   │   ├── fundamental.py        # PER, PBR, ROE, 부채비율 (섹터 상대비교)
-│   │   ├── momentum.py           # 거래량 급증, 기관 순매수, 52주 신고가
+│   │   ├── momentum.py           # 거래량 급증(50%), 기관 순매수(20%), 60일 가격 모멘텀(30%)
 │   │   ├── aggregator.py         # 가중합 → Top 5 추출
 │   │   └── macro_adjuster.py     # [STEP A] 금리 트렌드 → 재무 내부 가중치 / [STEP B] 환율 → 섹터 보정
 │   │
